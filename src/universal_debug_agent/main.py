@@ -16,6 +16,7 @@ from rich.syntax import Syntax
 
 from universal_debug_agent.config import load_profile
 from universal_debug_agent.mcp.factory import create_mcp_servers
+from universal_debug_agent.memory.store import MemoryRecord, MemoryStore, resolve_memory_path
 from universal_debug_agent.models.factory import create_model
 from universal_debug_agent.orchestrator.state_machine import InvestigationOrchestrator
 from universal_debug_agent.tools import code_tools
@@ -58,6 +59,20 @@ async def _run_investigation(
     model_desc = profile.model.model_name or profile.model.provider
     console.print(f"[green]Model:[/green] {profile.model.provider} / {model_desc}")
 
+    # Load memory
+    memory_context = ""
+    memory_store = None
+    if profile.memory.enabled:
+        memory_path = resolve_memory_path(profile.memory.path, profile.project.name)
+        memory_store = MemoryStore(memory_path)
+        memory_context = memory_store.build_prompt_context(
+            max_entries=profile.memory.max_entries_in_prompt
+        )
+        record_count = len(memory_store.load())
+        console.print(f"[green]Memory:[/green] {memory_path} ({record_count} past records)")
+    else:
+        console.print("[dim]Memory: disabled[/dim]")
+
     # Create MCP servers
     mcp_servers = create_mcp_servers(profile)
     if mcp_servers:
@@ -72,9 +87,30 @@ async def _run_investigation(
         profile=profile,
         mcp_servers=mcp_servers,
         model=model,
+        memory_context=memory_context,
     )
 
     report = await orchestrator.run(issue)
+
+    # Save to memory
+    if memory_store is not None:
+        top_hypothesis = ""
+        dead_ends: list[str] = []
+        key_findings: list[str] = []
+
+        if report.root_cause_hypotheses:
+            top = report.root_cause_hypotheses[0]
+            top_hypothesis = top.hypothesis
+            key_findings = top.supporting_evidence
+
+        memory_store.save(MemoryRecord(
+            issue=report.issue_summary or issue,
+            root_cause=top_hypothesis,
+            classification=report.classification.value,
+            key_findings=key_findings,
+            dead_ends=dead_ends,
+        ))
+        console.print("[green]Memory updated[/green]")
 
     # Output report
     report_json = report.model_dump_json(indent=2)

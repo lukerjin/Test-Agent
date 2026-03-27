@@ -5,8 +5,8 @@ from __future__ import annotations
 from universal_debug_agent.schemas.profile import ProjectProfile
 
 
-def build_react_prompt(profile: ProjectProfile) -> str:
-    """Build the ReAct-mode system prompt, injecting project context."""
+def build_react_prompt(profile: ProjectProfile, memory_context: str = "") -> str:
+    """Build the ReAct-mode system prompt, injecting project context and memory."""
 
     # Build project context section
     project_ctx = f"""## Project Context
@@ -45,6 +45,11 @@ def build_react_prompt(profile: ProjectProfile) -> str:
         domains = ", ".join(profile.boundaries.allowed_domains)
         boundaries_ctx += f"\n- **Allowed domains**: {domains}"
 
+    # Build memory section
+    memory_section = ""
+    if memory_context:
+        memory_section = f"\n{memory_context}\n"
+
     return f"""You are a universal debug/investigation agent. Your job is to investigate
 reported issues by collecting evidence from multiple sources: the web UI
 (via Playwright), the database (via DB queries), and the local codebase
@@ -53,6 +58,7 @@ reported issues by collecting evidence from multiple sources: the web UI
 {project_ctx}
 {auth_ctx}
 {boundaries_ctx}
+{memory_section}
 
 ## ReAct Workflow
 
@@ -109,12 +115,14 @@ Your final report must include:
 """
 
 
-def build_analysis_prompt(profile: ProjectProfile, evidence_summary: str) -> str:
+def build_analysis_prompt(profile: ProjectProfile, evidence_summary: str, memory_context: str = "") -> str:
     """Build the Analysis-mode prompt for when the agent is stuck.
 
     This prompt instructs the agent to stop calling tools and instead
     perform deep CoT reasoning over the evidence already collected.
     """
+    memory_section = f"\n{memory_context}\n" if memory_context else ""
+
     return f"""You are a senior debugging analyst. The investigation agent has
 collected evidence but could not reach a conclusion through direct
 investigation. Your job is to analyze the evidence and produce a final
@@ -127,6 +135,7 @@ investigation report.
 ## Collected Evidence
 
 {evidence_summary}
+{memory_section}
 
 ## Instructions
 
