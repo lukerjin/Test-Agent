@@ -1,0 +1,59 @@
+project:
+  name: "Example E-commerce App"
+  description: "A sample e-commerce platform for demonstrating the debug agent"
+
+environment:
+  type: "web"
+  base_url: "https://staging.example.com"
+  start_command: "npm run dev"
+  health_check_url: "/api/health"
+
+auth:
+  method: "form"
+  login_url: "/login"
+  test_accounts:
+    - role: "admin"
+      username_env: "TEST_ADMIN_USER"
+      password_env: "TEST_ADMIN_PASS"
+    - role: "user"
+      username_env: "TEST_USER_USER"
+      password_env: "TEST_USER_PASS"
+
+code:
+  root_dir: "/path/to/your/project"
+  branch: "main"
+  entry_dirs:
+    - "src/pages"
+    - "src/api"
+    - "src/components"
+  config_files:
+    - ".env.staging"
+    - "src/config/features.ts"
+
+mcp_servers:
+  playwright:
+    enabled: true
+    command: "npx"
+    args: ["@anthropic-ai/mcp-playwright"]
+  database:
+    enabled: true
+    command: "node"
+    args: ["./mcp-servers/db-mcp/index.js"]
+    env:
+      DB_TYPE: "mysql"
+      DB_HOST_ENV: "DB_HOST"
+      DB_PORT_ENV: "DB_PORT"
+      DB_USER_ENV: "DB_USER"
+      DB_PASSWORD_ENV: "DB_PASSWORD"
+      DB_NAME_ENV: "DB_NAME"
+
+boundaries:
+  readonly: true
+  forbidden_actions:
+    - "DELETE FROM"
+    - "DROP TABLE"
+    - "INSERT INTO"
+    - "UPDATE"
+  max_steps: 30
+  allowed_domains:
+    - "staging.example.com"
