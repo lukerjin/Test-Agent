@@ -7,6 +7,7 @@ import json
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
+from typing import Any
 
 from agents import Runner
 from agents.mcp import MCPServerStdio
@@ -130,9 +131,10 @@ class EvidenceCollector:
 class InvestigationOrchestrator:
     """Main orchestrator — runs single agent in two modes."""
 
-    def __init__(self, profile: ProjectProfile, mcp_servers: list[MCPServerStdio]):
+    def __init__(self, profile: ProjectProfile, mcp_servers: list[MCPServerStdio], model: Any = "gpt-4o"):
         self.profile = profile
         self.mcp_servers = mcp_servers
+        self.model = model
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(max_steps=profile.boundaries.max_steps)
         self.evidence_collector = EvidenceCollector()
@@ -152,6 +154,7 @@ class InvestigationOrchestrator:
         react_agent = create_brain_agent(
             profile=self.profile,
             mcp_servers=self.mcp_servers,
+            model=self.model,
             mode="react",
         )
 
@@ -172,6 +175,7 @@ class InvestigationOrchestrator:
         analysis_agent = create_brain_agent(
             profile=self.profile,
             mcp_servers=self.mcp_servers,
+            model=self.model,
             mode="analysis",
             evidence_summary=evidence_summary,
         )
