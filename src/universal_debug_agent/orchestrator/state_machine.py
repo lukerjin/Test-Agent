@@ -131,10 +131,17 @@ class EvidenceCollector:
 class InvestigationOrchestrator:
     """Main orchestrator — runs single agent in two modes."""
 
-    def __init__(self, profile: ProjectProfile, mcp_servers: list[MCPServerStdio], model: Any = "gpt-4o"):
+    def __init__(
+        self,
+        profile: ProjectProfile,
+        mcp_servers: list[MCPServerStdio],
+        model: Any = "gpt-4o",
+        memory_context: str = "",
+    ):
         self.profile = profile
         self.mcp_servers = mcp_servers
         self.model = model
+        self.memory_context = memory_context
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(max_steps=profile.boundaries.max_steps)
         self.evidence_collector = EvidenceCollector()
@@ -156,6 +163,7 @@ class InvestigationOrchestrator:
             mcp_servers=self.mcp_servers,
             model=self.model,
             mode="react",
+            memory_context=self.memory_context,
         )
 
         try:
@@ -178,6 +186,7 @@ class InvestigationOrchestrator:
             model=self.model,
             mode="analysis",
             evidence_summary=evidence_summary,
+            memory_context=self.memory_context,
         )
 
         analysis_input = (

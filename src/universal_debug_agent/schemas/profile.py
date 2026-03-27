@@ -52,6 +52,14 @@ class ModelConfig(BaseModel):
     base_url: str | None = None  # Custom endpoint URL (overrides provider default)
 
 
+class MemoryConfig(BaseModel):
+    """Investigation memory — stores past findings per project."""
+
+    enabled: bool = False
+    path: str = "./memory/{project_name}.jsonl"  # supports {project_name} placeholder
+    max_entries_in_prompt: int = 20  # how many past records to inject into prompt
+
+
 class BoundariesConfig(BaseModel):
     readonly: bool = True
     forbidden_actions: list[str] = Field(
@@ -69,5 +77,6 @@ class ProjectProfile(BaseModel):
     auth: AuthConfig = Field(default_factory=AuthConfig)
     code: CodeConfig
     model: ModelConfig = Field(default_factory=ModelConfig)
+    memory: MemoryConfig = Field(default_factory=MemoryConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     boundaries: BoundariesConfig = Field(default_factory=BoundariesConfig)

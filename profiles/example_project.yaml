@@ -47,6 +47,12 @@ model:
 #   base_url: "https://your-api.example.com/v1"
 #   api_key_env: "YOUR_API_KEY"
 
+# --- Memory ---
+memory:
+  enabled: true
+  path: "./memory/{project_name}.jsonl"   # auto-creates, per-project file
+  max_entries_in_prompt: 20               # inject last N records into prompt
+
 code:
   root_dir: "/path/to/your/project"
   branch: "main"

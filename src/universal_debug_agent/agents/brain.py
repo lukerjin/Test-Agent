@@ -20,6 +20,7 @@ def create_brain_agent(
     model: Any = "gpt-4o",
     mode: str = "react",
     evidence_summary: str = "",
+    memory_context: str = "",
 ) -> Agent:
     """Create the debug agent in the given mode.
 
@@ -29,14 +30,15 @@ def create_brain_agent(
         model: Model string or OpenAIChatCompletionsModel instance.
         mode: "react" for normal investigation, "analysis" for deep reasoning.
         evidence_summary: Collected evidence text (only used in analysis mode).
+        memory_context: Formatted past investigation memory for prompt injection.
     """
     if mode == "react":
-        instructions = build_react_prompt(profile)
+        instructions = build_react_prompt(profile, memory_context=memory_context)
         tools = [read_file, grep_code, list_directory, submit_report]
         output_type = None
         temperature = 0.2
     else:
-        instructions = build_analysis_prompt(profile, evidence_summary)
+        instructions = build_analysis_prompt(profile, evidence_summary, memory_context=memory_context)
         tools = [submit_report]
         output_type = InvestigationReport
         temperature = 0.7
