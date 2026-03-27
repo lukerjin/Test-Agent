@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from agents import Agent, ModelSettings
 from agents.mcp import MCPServerStdio
 
@@ -15,6 +17,7 @@ from universal_debug_agent.tools.report_tool import submit_report
 def create_brain_agent(
     profile: ProjectProfile,
     mcp_servers: list[MCPServerStdio],
+    model: Any = "gpt-4o",
     mode: str = "react",
     evidence_summary: str = "",
 ) -> Agent:
@@ -23,6 +26,7 @@ def create_brain_agent(
     Args:
         profile: The project profile with context and boundaries.
         mcp_servers: List of MCP servers (Playwright, DB, etc.).
+        model: Model string or OpenAIChatCompletionsModel instance.
         mode: "react" for normal investigation, "analysis" for deep reasoning.
         evidence_summary: Collected evidence text (only used in analysis mode).
     """
@@ -43,6 +47,6 @@ def create_brain_agent(
         mcp_servers=mcp_servers,
         tools=tools,
         output_type=output_type,
-        model="gpt-4o",
+        model=model,
         model_settings=ModelSettings(temperature=temperature),
     )

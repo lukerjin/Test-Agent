@@ -19,6 +19,34 @@ auth:
       username_env: "TEST_USER_USER"
       password_env: "TEST_USER_PASS"
 
+# --- LLM Configuration ---
+# Uncomment ONE of the following blocks:
+
+# Option 1: OpenAI (default)
+model:
+  provider: "openai"
+  model_name: "gpt-4o"
+  # api_key_env: "OPENAI_API_KEY"  # default, auto-detected
+
+# Option 2: Gemini (free tier available)
+# model:
+#   provider: "gemini"
+#   model_name: "gemini-2.0-flash"
+#   api_key_env: "GEMINI_API_KEY"
+
+# Option 3: DeepSeek
+# model:
+#   provider: "deepseek"
+#   model_name: "deepseek-chat"
+#   api_key_env: "DEEPSEEK_API_KEY"
+
+# Option 4: Any OpenAI-compatible API
+# model:
+#   provider: "custom"
+#   model_name: "your-model-name"
+#   base_url: "https://your-api.example.com/v1"
+#   api_key_env: "YOUR_API_KEY"
+
 code:
   root_dir: "/path/to/your/project"
   branch: "main"

@@ -43,6 +43,15 @@ class MCPServerConfig(BaseModel):
     env: dict[str, str] = Field(default_factory=dict)
 
 
+class ModelConfig(BaseModel):
+    """LLM provider configuration — supports OpenAI, Gemini, and any OpenAI-compatible API."""
+
+    provider: str = "openai"  # openai | gemini | deepseek | groq | together | openrouter
+    model_name: str | None = None  # None = use provider default
+    api_key_env: str | None = None  # Env var name for API key (e.g. "GEMINI_API_KEY")
+    base_url: str | None = None  # Custom endpoint URL (overrides provider default)
+
+
 class BoundariesConfig(BaseModel):
     readonly: bool = True
     forbidden_actions: list[str] = Field(
@@ -59,5 +68,6 @@ class ProjectProfile(BaseModel):
     environment: EnvironmentConfig = Field(default_factory=EnvironmentConfig)
     auth: AuthConfig = Field(default_factory=AuthConfig)
     code: CodeConfig
+    model: ModelConfig = Field(default_factory=ModelConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     boundaries: BoundariesConfig = Field(default_factory=BoundariesConfig)

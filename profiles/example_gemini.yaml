@@ -1,0 +1,26 @@
+# Example profile using Gemini (free tier)
+# Usage: export GEMINI_API_KEY=your-key
+#        python -m universal_debug_agent -p profiles/example_gemini.yaml -i "issue description"
+
+project:
+  name: "My App (Gemini)"
+  description: "Example project using Gemini as the LLM"
+
+model:
+  provider: "gemini"
+  model_name: "gemini-2.0-flash"
+  # api_key_env: "GEMINI_API_KEY"  # auto-detected for gemini provider
+
+environment:
+  type: "web"
+  base_url: "https://staging.example.com"
+
+auth:
+  method: "none"
+
+code:
+  root_dir: "/path/to/your/project"
+
+boundaries:
+  readonly: true
+  max_steps: 30

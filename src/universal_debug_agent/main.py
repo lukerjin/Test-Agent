@@ -16,6 +16,7 @@ from rich.syntax import Syntax
 
 from universal_debug_agent.config import load_profile
 from universal_debug_agent.mcp.factory import create_mcp_servers
+from universal_debug_agent.models.factory import create_model
 from universal_debug_agent.orchestrator.state_machine import InvestigationOrchestrator
 from universal_debug_agent.tools import code_tools
 
@@ -52,6 +53,11 @@ async def _run_investigation(
     # Configure code tools with the project root
     code_tools.configure(profile.code.root_dir)
 
+    # Create model
+    model = create_model(profile.model)
+    model_desc = profile.model.model_name or profile.model.provider
+    console.print(f"[green]Model:[/green] {profile.model.provider} / {model_desc}")
+
     # Create MCP servers
     mcp_servers = create_mcp_servers(profile)
     if mcp_servers:
@@ -65,6 +71,7 @@ async def _run_investigation(
     orchestrator = InvestigationOrchestrator(
         profile=profile,
         mcp_servers=mcp_servers,
+        model=model,
     )
 
     report = await orchestrator.run(issue)
@@ -119,6 +126,7 @@ def validate_profile(
         p = load_profile(profile)
         console.print(f"[green]Valid profile:[/green] {p.project.name}")
         console.print(f"  Environment: {p.environment.type} @ {p.environment.base_url}")
+        console.print(f"  Model: {p.model.provider} / {p.model.model_name or 'default'}")
         console.print(f"  Code root: {p.code.root_dir}")
         console.print(f"  MCP servers: {', '.join(p.mcp_servers.keys()) or 'none'}")
         console.print(f"  Max steps: {p.boundaries.max_steps}")
