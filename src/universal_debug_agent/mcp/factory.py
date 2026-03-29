@@ -30,11 +30,15 @@ def _resolve_env(env_config: dict[str, str]) -> dict[str, str]:
 def create_mcp_server(name: str, config: MCPServerConfig) -> MCPServerStdio:
     """Create a single MCP server from config."""
     env = _resolve_env(config.env) if config.env else None
+    params = {
+        "command": config.command,
+        "args": config.args,
+    }
+    if env:
+        params["env"] = env
     return MCPServerStdio(
+        params=params,
         name=name,
-        command=config.command,
-        args=config.args,
-        env=env,
     )
 
 
