@@ -85,10 +85,13 @@ class _CompatTransport(httpx.AsyncBaseTransport):
 
                 if modified:
                     new_content = json.dumps(body).encode()
+                    # Rebuild headers with correct Content-Length
+                    headers = dict(request.headers)
+                    headers["content-length"] = str(len(new_content))
                     request = httpx.Request(
                         method=request.method,
                         url=request.url,
-                        headers=request.headers,
+                        headers=headers,
                         content=new_content,
                     )
             except (json.JSONDecodeError, UnicodeDecodeError):
