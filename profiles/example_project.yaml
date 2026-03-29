@@ -68,7 +68,7 @@ mcp_servers:
   playwright:
     enabled: true
     command: "npx"
-    args: ["@anthropic-ai/mcp-playwright"]
+    args: ["@playwright/mcp@latest"]
   database:
     enabled: true
     command: "node"
