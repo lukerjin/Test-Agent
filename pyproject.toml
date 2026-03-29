@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "universal-debug-agent"
 version = "0.1.0"
-description = "Universal debug/investigation agent based on OpenAI Agents SDK"
+description = "Universal E2E test execution + data verification agent based on OpenAI Agents SDK"
 requires-python = ">=3.11"
 license = "MIT"
 dependencies = [
@@ -23,7 +23,7 @@ dev = [
 ]
 
 [project.scripts]
-debug-agent = "universal_debug_agent.main:app"
+test-agent = "universal_debug_agent.main:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/universal_debug_agent"]

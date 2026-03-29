@@ -1,6 +1,6 @@
 # Example profile using Gemini (free tier)
 # Usage: export GEMINI_API_KEY=your-key
-#        python -m universal_debug_agent -p profiles/example_gemini.yaml -i "issue description"
+#        python -m universal_debug_agent test -p profiles/example_gemini.yaml -s "your test scenario"
 
 project:
   name: "My App (Gemini)"

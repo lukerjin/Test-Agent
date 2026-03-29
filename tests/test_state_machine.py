@@ -77,8 +77,8 @@ class TestEvidenceCollector:
         ec.collect("grep_code", "pattern=login", "app.ts:10:login()")
 
         summary = ec.build_summary()
-        assert "Evidence #1: read_file" in summary
-        assert "Evidence #2: grep_code" in summary
+        assert "Step #1: read_file" in summary
+        assert "Step #2: grep_code" in summary
         assert "app.ts:10:login()" in summary
 
     def test_empty_summary(self):

@@ -1,4 +1,4 @@
-"""CLI entry point for the Universal Debug Agent."""
+"""CLI entry point for the Universal Test Agent."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import typer
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
+from rich.table import Table
 
 from universal_debug_agent.config import load_profile
 from universal_debug_agent.mcp.factory import create_mcp_servers
@@ -22,15 +23,15 @@ from universal_debug_agent.orchestrator.state_machine import InvestigationOrches
 from universal_debug_agent.tools import code_tools
 
 app = typer.Typer(
-    name="debug-agent",
-    help="Universal Debug Agent — investigate issues across any project.",
+    name="test-agent",
+    help="Universal Test Agent — execute test scenarios and verify data across any project.",
 )
 console = Console()
 
 
-async def _run_investigation(
+async def _run_test(
     profile_path: str,
-    issue: str,
+    scenario: str,
     output: str | None,
     max_steps: int | None,
     verbose: bool,
@@ -80,8 +81,8 @@ async def _run_investigation(
     else:
         console.print("[yellow]No MCP servers configured[/yellow]")
 
-    # Run investigation
-    console.print(Panel(issue, title="Issue", border_style="blue"))
+    # Run test
+    console.print(Panel(scenario, title="Test Scenario", border_style="blue"))
 
     orchestrator = InvestigationOrchestrator(
         profile=profile,
@@ -90,27 +91,31 @@ async def _run_investigation(
         memory_context=memory_context,
     )
 
-    report = await orchestrator.run(issue)
+    report = await orchestrator.run(scenario)
 
     # Save to memory
     if memory_store is not None:
-        top_hypothesis = ""
-        dead_ends: list[str] = []
-        key_findings: list[str] = []
-
-        if report.root_cause_hypotheses:
-            top = report.root_cause_hypotheses[0]
-            top_hypothesis = top.hypothesis
-            key_findings = top.supporting_evidence
+        issues = "; ".join(report.issues_found) if report.issues_found else ""
+        failed_steps = [
+            s.action for s in report.steps_executed if s.status != "pass"
+        ]
+        failed_checks = [
+            v.check_name for v in report.data_verifications if v.status != "pass"
+        ]
 
         memory_store.save(MemoryRecord(
-            issue=report.issue_summary or issue,
-            root_cause=top_hypothesis,
-            classification=report.classification.value,
-            key_findings=key_findings,
-            dead_ends=dead_ends,
+            issue=report.scenario_summary,
+            root_cause=issues,
+            classification=report.overall_status.value,
+            key_findings=[f"Steps: {len(report.steps_executed)}, Verifications: {len(report.data_verifications)}"]
+                + [f"FAIL step: {s}" for s in failed_steps]
+                + [f"FAIL check: {c}" for c in failed_checks],
+            dead_ends=[],
         ))
         console.print("[green]Memory updated[/green]")
+
+    # Print summary table
+    _print_summary(report)
 
     # Output report
     report_json = report.model_dump_json(indent=2)
@@ -120,33 +125,83 @@ async def _run_investigation(
         console.print(f"\n[green]Report saved to:[/green] {output}")
     else:
         console.print("\n")
-        console.print(Panel("Investigation Report", style="bold green"))
         console.print(Syntax(report_json, "json", theme="monokai"))
 
 
+def _print_summary(report) -> None:
+    """Print a concise summary table of the test results."""
+    console.print()
+
+    # Overall status
+    status_color = "green" if report.overall_status.value == "pass" else "red"
+    console.print(
+        Panel(
+            f"[{status_color} bold]{report.overall_status.value.upper()}[/{status_color} bold]",
+            title=report.scenario_summary,
+            border_style=status_color,
+        )
+    )
+
+    # Steps table
+    if report.steps_executed:
+        table = Table(title="Steps Executed")
+        table.add_column("#", width=4)
+        table.add_column("Action")
+        table.add_column("Status", width=10)
+        table.add_column("Notes")
+
+        for step in report.steps_executed:
+            color = "green" if step.status.value == "pass" else "red"
+            table.add_row(
+                str(step.step_number),
+                step.action,
+                f"[{color}]{step.status.value}[/{color}]",
+                step.notes or step.actual_result[:60],
+            )
+        console.print(table)
+
+    # Data verification table
+    if report.data_verifications:
+        table = Table(title="Data Verifications")
+        table.add_column("Check")
+        table.add_column("Expected")
+        table.add_column("Actual")
+        table.add_column("Status", width=10)
+
+        for v in report.data_verifications:
+            color = "green" if v.status.value == "pass" else "red"
+            table.add_row(
+                v.check_name,
+                v.expected[:40],
+                v.actual[:40],
+                f"[{color}]{v.status.value}[/{color}]",
+            )
+        console.print(table)
+
+    # Issues
+    if report.issues_found:
+        console.print("\n[red bold]Issues Found:[/red bold]")
+        for issue in report.issues_found:
+            console.print(f"  - {issue}")
+
+
 @app.command()
-def investigate(
+def test(
     profile: str = typer.Option(..., "--profile", "-p", help="Path to project profile YAML"),
-    issue: Optional[str] = typer.Option(None, "--issue", "-i", help="Issue description text"),
-    issue_url: Optional[str] = typer.Option(None, "--issue-url", help="GitHub issue URL"),
+    scenario: Optional[str] = typer.Option(None, "--scenario", "-s", help="Test scenario description"),
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output report file path"),
-    max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override max investigation steps"),
+    max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override max steps"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
 ) -> None:
-    """Investigate an issue using the debug agent."""
+    """Execute a test scenario on the target application."""
 
-    if not issue and not issue_url:
-        console.print("[red]Error: provide --issue or --issue-url[/red]")
+    if not scenario:
+        console.print("[red]Error: provide --scenario / -s[/red]")
         raise typer.Exit(1)
 
-    # For v1, issue_url support is deferred; require --issue
-    if issue_url and not issue:
-        console.print("[yellow]--issue-url support coming in v2. Please use --issue for now.[/yellow]")
-        raise typer.Exit(1)
-
-    asyncio.run(_run_investigation(
+    asyncio.run(_run_test(
         profile_path=profile,
-        issue=issue or "",
+        scenario=scenario,
         output=output,
         max_steps=max_steps,
         verbose=verbose,
