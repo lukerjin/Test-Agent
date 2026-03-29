@@ -1,4 +1,4 @@
-"""Investigation Report schema — structured output from the agent."""
+"""Test Report schema — structured output from the agent."""
 
 from __future__ import annotations
 
@@ -8,23 +8,20 @@ from enum import Enum
 from pydantic import BaseModel, Field
 
 
+class StepStatus(str, Enum):
+    PASS = "pass"
+    FAIL = "fail"
+    SKIP = "skip"
+    BLOCKED = "blocked"
+
+
 class EvidenceType(str, Enum):
     SCREENSHOT = "screenshot"
     CONSOLE_LOG = "console_log"
     NETWORK_LOG = "network_log"
     DB_QUERY = "db_query"
     CODE_SNIPPET = "code_snippet"
-    CONSISTENCY_CHECK = "consistency_check"
     OTHER = "other"
-
-
-class IssueClassification(str, Enum):
-    FRONTEND = "frontend"
-    DATA = "data"
-    ENVIRONMENT = "environment"
-    CONFIG = "config"
-    BACKEND = "backend"
-    UNKNOWN = "unknown"
 
 
 class Evidence(BaseModel):
@@ -34,21 +31,26 @@ class Evidence(BaseModel):
     content: str = ""
 
 
-class ConsistencyCheck(BaseModel):
-    """UI vs DB cross-validation result."""
+class ScenarioStep(BaseModel):
+    """A single executed step in the test scenario."""
 
-    ui_source: str
-    ui_value: str
-    db_query: str
-    db_value: str
-    consistent: bool
+    step_number: int
+    action: str  # "打开商品页", "点击加入购物车", "填写地址"
+    status: StepStatus = StepStatus.PASS
+    actual_result: str = ""  # what actually happened
+    screenshot: str = ""  # screenshot path/reference if taken
+    notes: str = ""  # e.g. "检测到未登录，自动走登录流程"
+
+
+class DataVerification(BaseModel):
+    """A single data verification check — UI vs DB or expected vs actual."""
+
+    check_name: str  # "订单是否创建", "库存是否扣减"
+    query: str = ""  # SQL or description of how data was checked
+    expected: str = ""  # what we expected
+    actual: str = ""  # what we found
+    status: StepStatus = StepStatus.PASS
     severity: str = Field(default="medium", pattern=r"^(high|medium|low)$")
-
-
-class Hypothesis(BaseModel):
-    hypothesis: str
-    confidence: float = Field(ge=0.0, le=1.0)
-    supporting_evidence: list[str] = Field(default_factory=list)
 
 
 class ReportMetadata(BaseModel):
@@ -59,14 +61,14 @@ class ReportMetadata(BaseModel):
     mode_switches: int = 0
 
 
-class InvestigationReport(BaseModel):
-    """Final structured output of an investigation."""
+class ScenarioReport(BaseModel):
+    """Final structured output of a test scenario execution."""
 
-    issue_summary: str
-    steps_to_reproduce: list[str] = Field(default_factory=list)
+    scenario_summary: str  # "购买产品 A 的完整流程"
+    overall_status: StepStatus = StepStatus.PASS  # pass only if ALL steps + verifications pass
+    steps_executed: list[ScenarioStep] = Field(default_factory=list)
+    data_verifications: list[DataVerification] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
-    consistency_checks: list[ConsistencyCheck] = Field(default_factory=list)
-    root_cause_hypotheses: list[Hypothesis] = Field(default_factory=list)
-    classification: IssueClassification = IssueClassification.UNKNOWN
-    next_steps: list[str] = Field(default_factory=list)
+    issues_found: list[str] = Field(default_factory=list)  # any problems encountered
+    next_steps: list[str] = Field(default_factory=list)  # recommendations
     metadata: ReportMetadata = Field(default_factory=ReportMetadata)

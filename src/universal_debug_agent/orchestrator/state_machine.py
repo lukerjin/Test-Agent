@@ -16,10 +16,9 @@ from universal_debug_agent.agents.brain import create_brain_agent
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
 from universal_debug_agent.schemas.profile import ProjectProfile
 from universal_debug_agent.schemas.report import (
-    Evidence,
-    EvidenceType,
-    InvestigationReport,
     ReportMetadata,
+    StepStatus,
+    ScenarioReport,
 )
 
 logger = logging.getLogger(__name__)
@@ -103,7 +102,7 @@ class StuckDetector:
 
 @dataclass
 class EvidenceCollector:
-    """Collects evidence from tool calls during investigation."""
+    """Collects evidence from tool calls during test execution."""
 
     items: list[dict] = field(default_factory=list)
 
@@ -121,7 +120,7 @@ class EvidenceCollector:
         parts: list[str] = []
         for i, item in enumerate(self.items, 1):
             parts.append(
-                f"### Evidence #{i}: {item['tool']}\n"
+                f"### Step #{i}: {item['tool']}\n"
                 f"**Args**: {item['args'][:200]}\n"
                 f"**Result**: {item['result_preview']}\n"
             )
@@ -146,12 +145,12 @@ class InvestigationOrchestrator:
         self.stuck_detector = StuckDetector(max_steps=profile.boundaries.max_steps)
         self.evidence_collector = EvidenceCollector()
 
-    async def run(self, issue: str) -> InvestigationReport:
-        """Run the full investigation pipeline."""
+    async def run(self, scenario: str) -> ScenarioReport:
+        """Run the full test execution pipeline."""
 
-        # Phase 1: ReAct mode
+        # Phase 1: ReAct mode — execute the test scenario
         self.state = InvestigationState.REACT
-        logger.info("Starting ReAct investigation...")
+        logger.info("Starting test execution...")
 
         hooks = InvestigationHooks(
             stuck_detector=self.stuck_detector,
@@ -167,17 +166,17 @@ class InvestigationOrchestrator:
         )
 
         try:
-            result = await Runner.run(react_agent, issue, hooks=hooks)
+            result = await Runner.run(react_agent, scenario, hooks=hooks)
 
             # Try to parse the output as a report
             return self._extract_report(result)
 
         except SwitchToAnalysisMode as e:
             logger.info(f"Switching to analysis mode: {e.reason}")
-            return await self._run_analysis(issue, e.evidence_summary)
+            return await self._run_analysis(scenario, e.evidence_summary)
 
-    async def _run_analysis(self, issue: str, evidence_summary: str) -> InvestigationReport:
-        """Phase 2: Analysis mode — deep reasoning over collected evidence."""
+    async def _run_analysis(self, scenario: str, evidence_summary: str) -> ScenarioReport:
+        """Phase 2: Analysis mode — analyze what happened when agent got stuck."""
         self.state = InvestigationState.ANALYZING
 
         analysis_agent = create_brain_agent(
@@ -190,34 +189,37 @@ class InvestigationOrchestrator:
         )
 
         analysis_input = (
-            f"## Original Issue\n{issue}\n\n"
-            f"## Investigation Context\n"
-            f"The ReAct investigation was stopped because the agent appeared stuck. "
-            f"Please analyze the collected evidence and produce a final report.\n\n"
+            f"## Test Scenario\n{scenario}\n\n"
+            f"## Execution Context\n"
+            f"The test execution agent was stopped because it appeared stuck. "
+            f"Please analyze the execution log and produce a final test report.\n\n"
             f"Total steps taken: {self.stuck_detector.step_count}"
         )
 
         result = await Runner.run(analysis_agent, analysis_input)
         return self._extract_report(result)
 
-    def _extract_report(self, result) -> InvestigationReport:
-        """Extract InvestigationReport from Runner result."""
+    def _extract_report(self, result) -> ScenarioReport:
+        """Extract ScenarioReport from Runner result."""
         # If output_type was set, result.final_output is already the model
-        if isinstance(result.final_output, InvestigationReport):
+        if isinstance(result.final_output, ScenarioReport):
             report = result.final_output
         elif isinstance(result.final_output, str):
             # Try to parse JSON from the output
             try:
-                report = InvestigationReport.model_validate_json(result.final_output)
+                report = ScenarioReport.model_validate_json(result.final_output)
             except Exception:
                 # Fallback: create a minimal report from the text
-                report = InvestigationReport(
-                    issue_summary="Investigation completed (unstructured output)",
+                report = ScenarioReport(
+                    scenario_summary="Test execution completed (unstructured output)",
+                    overall_status=StepStatus.FAIL,
+                    issues_found=["Agent output could not be parsed as structured report"],
                     next_steps=["Review the raw agent output for details"],
                 )
         else:
-            report = InvestigationReport(
-                issue_summary="Investigation completed",
+            report = ScenarioReport(
+                scenario_summary="Test execution completed",
+                overall_status=StepStatus.FAIL,
             )
 
         # Fill in metadata

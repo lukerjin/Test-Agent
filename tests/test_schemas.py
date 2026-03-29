@@ -4,13 +4,13 @@ from datetime import datetime
 
 from universal_debug_agent.schemas.profile import ProjectProfile
 from universal_debug_agent.schemas.report import (
-    ConsistencyCheck,
+    DataVerification,
     Evidence,
     EvidenceType,
-    Hypothesis,
-    InvestigationReport,
-    IssueClassification,
     ReportMetadata,
+    StepStatus,
+    ScenarioReport,
+    ScenarioStep,
 )
 
 
@@ -74,49 +74,92 @@ def test_full_profile():
     assert profile.boundaries.max_steps == 20
 
 
-def test_investigation_report():
-    report = InvestigationReport(
-        issue_summary="Order status mismatch",
-        steps_to_reproduce=["Login", "Go to /orders/123", "Check status"],
-        evidence=[
-            Evidence(
-                type=EvidenceType.SCREENSHOT,
-                source="/orders/123",
-                description="Page shows shipped",
-            ),
-            Evidence(
-                type=EvidenceType.DB_QUERY,
-                source="orders table",
-                content="status=pending",
-            ),
+def test_test_report_all_pass():
+    report = ScenarioReport(
+        scenario_summary="购买产品 A 的完整流程",
+        overall_status=StepStatus.PASS,
+        steps_executed=[
+            ScenarioStep(step_number=1, action="打开商品页", status=StepStatus.PASS, actual_result="页面加载成功"),
+            ScenarioStep(step_number=2, action="加入购物车", status=StepStatus.PASS, actual_result="购物车+1"),
+            ScenarioStep(step_number=3, action="完成支付", status=StepStatus.PASS, actual_result="显示订单成功页"),
         ],
-        consistency_checks=[
-            ConsistencyCheck(
-                ui_source="/orders/123",
-                ui_value="shipped",
-                db_query="SELECT status FROM orders WHERE id=123",
-                db_value="pending",
-                consistent=False,
+        data_verifications=[
+            DataVerification(
+                check_name="订单已创建",
+                query="SELECT * FROM orders WHERE user_id=1 ORDER BY id DESC LIMIT 1",
+                expected="1 row with status=pending",
+                actual="1 row with status=pending",
+                status=StepStatus.PASS,
+                severity="high",
+            ),
+            DataVerification(
+                check_name="order_items 包含产品 A",
+                query="SELECT * FROM order_items WHERE order_id=123",
+                expected="product_id=A, quantity=1",
+                actual="product_id=A, quantity=1",
+                status=StepStatus.PASS,
                 severity="high",
             ),
         ],
-        root_cause_hypotheses=[
-            Hypothesis(
-                hypothesis="Status mapping bug in frontend",
-                confidence=0.8,
-                supporting_evidence=["UI shows shipped but DB says pending"],
-            ),
+        evidence=[
+            Evidence(type=EvidenceType.SCREENSHOT, source="/checkout/success", description="订单成功页面"),
         ],
-        classification=IssueClassification.FRONTEND,
-        next_steps=["Check src/utils/statusMap.ts"],
     )
 
-    assert report.classification == IssueClassification.FRONTEND
-    assert len(report.consistency_checks) == 1
-    assert report.consistency_checks[0].consistent is False
+    assert report.overall_status == StepStatus.PASS
+    assert len(report.steps_executed) == 3
+    assert len(report.data_verifications) == 2
+    assert all(s.status == StepStatus.PASS for s in report.steps_executed)
+    assert all(v.status == StepStatus.PASS for v in report.data_verifications)
 
-    # Test JSON serialization roundtrip
+    # JSON roundtrip
     json_str = report.model_dump_json()
-    restored = InvestigationReport.model_validate_json(json_str)
-    assert restored.issue_summary == report.issue_summary
-    assert len(restored.root_cause_hypotheses) == 1
+    restored = ScenarioReport.model_validate_json(json_str)
+    assert restored.scenario_summary == report.scenario_summary
+    assert len(restored.steps_executed) == 3
+
+
+def test_test_report_with_failures():
+    report = ScenarioReport(
+        scenario_summary="购买产品 B",
+        overall_status=StepStatus.FAIL,
+        steps_executed=[
+            ScenarioStep(step_number=1, action="打开商品页", status=StepStatus.PASS),
+            ScenarioStep(step_number=2, action="加入购物车", status=StepStatus.FAIL, actual_result="按钮不可点击", notes="库存为0"),
+        ],
+        data_verifications=[
+            DataVerification(
+                check_name="库存检查",
+                query="SELECT stock FROM products WHERE id='B'",
+                expected="stock > 0",
+                actual="stock = 0",
+                status=StepStatus.FAIL,
+                severity="high",
+            ),
+        ],
+        issues_found=["产品 B 库存为 0，无法加入购物车"],
+        next_steps=["检查库存管理逻辑", "确认测试数据是否正确"],
+    )
+
+    assert report.overall_status == StepStatus.FAIL
+    assert report.steps_executed[1].status == StepStatus.FAIL
+    assert len(report.issues_found) == 1
+
+
+def test_test_report_blocked():
+    report = ScenarioReport(
+        scenario_summary="登录 + 购买",
+        overall_status=StepStatus.BLOCKED,
+        steps_executed=[
+            ScenarioStep(
+                step_number=1,
+                action="登录",
+                status=StepStatus.BLOCKED,
+                actual_result="遇到 CAPTCHA",
+                notes="无法自动解决验证码",
+            ),
+        ],
+        issues_found=["CAPTCHA 阻止自动登录"],
+    )
+
+    assert report.overall_status == StepStatus.BLOCKED

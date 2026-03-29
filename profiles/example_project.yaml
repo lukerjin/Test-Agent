@@ -1,6 +1,6 @@
 project:
   name: "Example E-commerce App"
-  description: "A sample e-commerce platform for demonstrating the debug agent"
+  description: "A sample e-commerce platform for demonstrating the test agent"
 
 environment:
   type: "web"
