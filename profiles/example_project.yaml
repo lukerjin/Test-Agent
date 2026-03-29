@@ -72,14 +72,13 @@ mcp_servers:
   database:
     enabled: true
     command: "node"
-    args: ["./mcp-servers/db-mcp/index.js"]
+    args: ["./path/to/your/db-mcp/index.js"]
     env:
-      DB_TYPE: "mysql"
       DB_HOST_ENV: "DB_HOST"
       DB_PORT_ENV: "DB_PORT"
       DB_USER_ENV: "DB_USER"
       DB_PASSWORD_ENV: "DB_PASSWORD"
-      DB_NAME_ENV: "DB_NAME"
+      DB_ALIASES_ENV: "DB_ALIASES"
 
 boundaries:
   readonly: true
