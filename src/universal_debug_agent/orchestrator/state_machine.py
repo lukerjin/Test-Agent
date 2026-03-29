@@ -134,7 +134,7 @@ class InvestigationOrchestrator:
         self,
         profile: ProjectProfile,
         mcp_servers: list[MCPServerStdio],
-        model: Any = "gpt-4o",
+        model: Any = None,
         memory_context: str = "",
     ):
         self.profile = profile
@@ -147,6 +147,28 @@ class InvestigationOrchestrator:
 
     async def run(self, scenario: str) -> ScenarioReport:
         """Run the full test execution pipeline."""
+
+        # Connect all MCP servers before running
+        for server in self.mcp_servers:
+            try:
+                await server.connect()
+                logger.info(f"Connected MCP server: {server.name}")
+            except Exception as e:
+                logger.error(f"Failed to connect MCP server {server.name}: {e}")
+                raise
+
+        try:
+            return await self._run_pipeline(scenario)
+        finally:
+            # Disconnect all MCP servers
+            for server in self.mcp_servers:
+                try:
+                    await server.cleanup()
+                except Exception as e:
+                    logger.warning(f"Error cleaning up MCP server {server.name}: {e}")
+
+    async def _run_pipeline(self, scenario: str) -> ScenarioReport:
+        """Internal pipeline after MCP servers are connected."""
 
         # Phase 1: ReAct mode — execute the test scenario
         self.state = InvestigationState.REACT

@@ -17,7 +17,7 @@ from universal_debug_agent.tools.report_tool import submit_report
 def create_brain_agent(
     profile: ProjectProfile,
     mcp_servers: list[MCPServerStdio],
-    model: Any = "gpt-4o",
+    model: Any = None,
     mode: str = "react",
     evidence_summary: str = "",
     memory_context: str = "",
