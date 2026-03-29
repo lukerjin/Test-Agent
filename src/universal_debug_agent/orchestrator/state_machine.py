@@ -160,11 +160,11 @@ class InvestigationOrchestrator:
         try:
             return await self._run_pipeline(scenario)
         finally:
-            # Disconnect all MCP servers
+            # Disconnect all MCP servers (suppress all errors to preserve original exception)
             for server in self.mcp_servers:
                 try:
                     await server.cleanup()
-                except Exception as e:
+                except BaseException as e:
                     logger.warning(f"Error cleaning up MCP server {server.name}: {e}")
 
     async def _run_pipeline(self, scenario: str) -> ScenarioReport:

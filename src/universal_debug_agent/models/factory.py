@@ -8,14 +8,21 @@ Supports:
 
 from __future__ import annotations
 
+import json
+import logging
 import os
+from typing import Any, Literal, cast
 
 from openai import AsyncOpenAI
+from openai._streaming import AsyncStream
+from openai._types import NOT_GIVEN
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 
 from universal_debug_agent.schemas.profile import ModelConfig
 
+logger = logging.getLogger(__name__)
 
 # Known provider base URLs
 _PROVIDER_BASE_URLS: dict[str, str] = {
@@ -35,6 +42,72 @@ _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "together": "meta-llama/Llama-3.3-70B-Instruct-Turbo",
     "openrouter": "openai/gpt-4o",
 }
+
+# Providers that need OpenAI-incompatible fields stripped from tool schemas
+_STRIP_STRICT_PROVIDERS = {"gemini", "deepseek", "groq", "together"}
+
+
+def _strip_strict_from_tools(tools: Any) -> Any:
+    """Remove 'strict' field from tool definitions for non-OpenAI providers."""
+    if not isinstance(tools, list):
+        return tools
+    for tool in tools:
+        if isinstance(tool, dict) and "function" in tool:
+            tool["function"].pop("strict", None)
+    return tools
+
+
+class _CompatChatCompletionsModel(OpenAIChatCompletionsModel):
+    """Subclass that strips OpenAI-specific fields before sending to non-OpenAI providers."""
+
+    async def _fetch_response(
+        self,
+        system_instructions,
+        input,
+        model_settings,
+        tools,
+        output_schema,
+        handoffs,
+        span,
+        tracing,
+        stream=False,
+        prompt=None,
+    ):
+        # Temporarily patch the client's create method to strip 'strict' from tools
+        original_create = self._get_client().chat.completions.create
+
+        async def patched_create(**kwargs):
+            if "tools" in kwargs and kwargs["tools"] is not NOT_GIVEN:
+                kwargs["tools"] = _strip_strict_from_tools(kwargs["tools"])
+            # Strip response_format if it contains json_schema with strict
+            if "response_format" in kwargs and kwargs["response_format"] is not NOT_GIVEN:
+                rf = kwargs["response_format"]
+                if isinstance(rf, dict) and "json_schema" in rf:
+                    rf["json_schema"].pop("strict", None)
+            # Strip parallel_tool_calls (not supported by all providers)
+            kwargs.pop("parallel_tool_calls", None)
+            # Strip other OpenAI-specific params
+            for unsupported in ("store", "reasoning_effort", "verbosity",
+                                "top_logprobs", "prompt_cache_retention"):
+                kwargs.pop(unsupported, None)
+            return await original_create(**kwargs)
+
+        self._get_client().chat.completions.create = patched_create  # type: ignore[assignment]
+        try:
+            return await super()._fetch_response(
+                system_instructions,
+                input,
+                model_settings,
+                tools,
+                output_schema,
+                handoffs,
+                span,
+                tracing,
+                stream,
+                prompt,
+            )
+        finally:
+            self._get_client().chat.completions.create = original_create  # type: ignore[assignment]
 
 
 def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
@@ -68,7 +141,14 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
         base_url=base_url,
     )
 
-    return OpenAIChatCompletionsModel(
+    # Use compatibility wrapper for providers that don't support OpenAI-specific fields
+    model_cls = (
+        _CompatChatCompletionsModel
+        if provider in _STRIP_STRICT_PROVIDERS or config.base_url
+        else OpenAIChatCompletionsModel
+    )
+
+    return model_cls(
         model=model_name,
         openai_client=client,
     )
