@@ -11,12 +11,9 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Literal, cast
 
+import httpx
 from openai import AsyncOpenAI
-from openai._streaming import AsyncStream
-from openai._types import NOT_GIVEN
-from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 
@@ -43,80 +40,65 @@ _PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "openrouter": "openai/gpt-4o",
 }
 
-# Providers that need OpenAI-incompatible fields stripped from tool schemas
+# Providers that need OpenAI-incompatible fields stripped
 _STRIP_STRICT_PROVIDERS = {"gemini", "deepseek", "groq", "together"}
 
-
-def _strip_strict_from_tools(tools: Any) -> Any:
-    """Remove 'strict' field from tool definitions for non-OpenAI providers."""
-    if not isinstance(tools, list):
-        return tools
-    for tool in tools:
-        if isinstance(tool, dict) and "function" in tool:
-            tool["function"].pop("strict", None)
-    return tools
+# Fields to remove from the top-level request body
+_UNSUPPORTED_TOP_LEVEL = {
+    "parallel_tool_calls", "store", "reasoning_effort",
+    "verbosity", "top_logprobs", "prompt_cache_retention",
+}
 
 
-class _CompatChatCompletionsModel(OpenAIChatCompletionsModel):
-    """Subclass that strips OpenAI-specific fields before sending to non-OpenAI providers."""
+class _CompatTransport(httpx.AsyncBaseTransport):
+    """httpx transport wrapper that strips OpenAI-specific fields from request JSON."""
 
-    async def _fetch_response(
-        self,
-        system_instructions,
-        input,
-        model_settings,
-        tools,
-        output_schema,
-        handoffs,
-        span,
-        tracing,
-        stream=False,
-        prompt=None,
-    ):
-        # Temporarily patch the client's create method to strip 'strict' from tools
-        original_create = self._get_client().chat.completions.create
+    def __init__(self, transport: httpx.AsyncBaseTransport):
+        self._transport = transport
 
-        async def patched_create(**kwargs):
-            if "tools" in kwargs and kwargs["tools"] is not NOT_GIVEN:
-                kwargs["tools"] = _strip_strict_from_tools(kwargs["tools"])
-            # Strip response_format if it contains json_schema with strict
-            if "response_format" in kwargs and kwargs["response_format"] is not NOT_GIVEN:
-                rf = kwargs["response_format"]
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.content:
+            try:
+                body = json.loads(request.content)
+                modified = False
+
+                # Strip unsupported top-level params
+                for key in _UNSUPPORTED_TOP_LEVEL:
+                    if key in body:
+                        del body[key]
+                        modified = True
+
+                # Strip 'strict' from tool definitions
+                if "tools" in body and isinstance(body["tools"], list):
+                    for tool in body["tools"]:
+                        if isinstance(tool, dict) and "function" in tool:
+                            if "strict" in tool["function"]:
+                                del tool["function"]["strict"]
+                                modified = True
+
+                # Strip 'strict' from response_format.json_schema
+                rf = body.get("response_format")
                 if isinstance(rf, dict) and "json_schema" in rf:
-                    rf["json_schema"].pop("strict", None)
-            # Strip parallel_tool_calls (not supported by all providers)
-            kwargs.pop("parallel_tool_calls", None)
-            # Strip other OpenAI-specific params
-            for unsupported in ("store", "reasoning_effort", "verbosity",
-                                "top_logprobs", "prompt_cache_retention"):
-                kwargs.pop(unsupported, None)
-            return await original_create(**kwargs)
+                    if "strict" in rf["json_schema"]:
+                        del rf["json_schema"]["strict"]
+                        modified = True
 
-        self._get_client().chat.completions.create = patched_create  # type: ignore[assignment]
-        try:
-            return await super()._fetch_response(
-                system_instructions,
-                input,
-                model_settings,
-                tools,
-                output_schema,
-                handoffs,
-                span,
-                tracing,
-                stream,
-                prompt,
-            )
-        finally:
-            self._get_client().chat.completions.create = original_create  # type: ignore[assignment]
+                if modified:
+                    new_content = json.dumps(body).encode()
+                    request = httpx.Request(
+                        method=request.method,
+                        url=request.url,
+                        headers=request.headers,
+                        content=new_content,
+                    )
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                pass  # Not JSON, pass through
+
+        return await self._transport.handle_async_request(request)
 
 
 def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
-    """Create a model instance from config.
-
-    Returns:
-        - A plain string model name for native OpenAI (the SDK handles it)
-        - An OpenAIChatCompletionsModel for other providers
-    """
+    """Create a model instance from config."""
     provider = config.provider
     model_name = config.model_name or _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o")
 
@@ -135,20 +117,24 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
             f"Known providers: {', '.join(_PROVIDER_BASE_URLS.keys())}"
         )
 
-    # Create an AsyncOpenAI client pointing at the provider's endpoint
-    client = AsyncOpenAI(
-        api_key=api_key,
-        base_url=base_url,
-    )
+    needs_compat = provider in _STRIP_STRICT_PROVIDERS or config.base_url
 
-    # Use compatibility wrapper for providers that don't support OpenAI-specific fields
-    model_cls = (
-        _CompatChatCompletionsModel
-        if provider in _STRIP_STRICT_PROVIDERS or config.base_url
-        else OpenAIChatCompletionsModel
-    )
+    if needs_compat:
+        # Use custom transport to strip unsupported fields at HTTP level
+        transport = _CompatTransport(httpx.AsyncHTTPTransport())
+        http_client = httpx.AsyncClient(transport=transport)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http_client,
+        )
+    else:
+        client = AsyncOpenAI(
+            api_key=api_key,
+            base_url=base_url,
+        )
 
-    return model_cls(
+    return OpenAIChatCompletionsModel(
         model=model_name,
         openai_client=client,
     )
