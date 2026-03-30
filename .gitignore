@@ -18,3 +18,7 @@ env/
 .ruff_cache/
 htmlcov/
 .coverage
+.DS_Store
+artifacts/
+memory/
+usage/

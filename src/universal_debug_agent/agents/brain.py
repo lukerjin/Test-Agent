@@ -10,6 +10,7 @@ from agents.mcp import MCPServerStdio
 from universal_debug_agent.agents.prompts import build_analysis_prompt, build_react_prompt
 from universal_debug_agent.schemas.profile import ProjectProfile
 from universal_debug_agent.schemas.report import ScenarioReport
+from universal_debug_agent.tools.auth_tools import get_test_account
 from universal_debug_agent.tools.code_tools import grep_code, list_directory, read_file
 from universal_debug_agent.tools.report_tool import submit_report
 
@@ -34,7 +35,7 @@ def create_brain_agent(
     """
     if mode == "react":
         instructions = build_react_prompt(profile, memory_context=memory_context)
-        tools = [read_file, grep_code, list_directory, submit_report]
+        tools = [read_file, grep_code, list_directory, get_test_account, submit_report]
         output_type = None
         temperature = 0.2
     else:

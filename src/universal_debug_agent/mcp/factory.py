@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime
+from pathlib import Path
 
 from agents.mcp import MCPServerStdio
 
@@ -30,16 +32,37 @@ def _resolve_env(env_config: dict[str, str]) -> dict[str, str]:
 def create_mcp_server(name: str, config: MCPServerConfig) -> MCPServerStdio:
     """Create a single MCP server from config."""
     env = _resolve_env(config.env) if config.env else None
+    cwd = _resolve_cwd(name, config)
     params = {
         "command": config.command,
         "args": config.args,
     }
     if env:
         params["env"] = env
+    if cwd:
+        params["cwd"] = cwd
     return MCPServerStdio(
         params=params,
         name=name,
     )
+
+
+def _resolve_cwd(name: str, config: MCPServerConfig) -> str | None:
+    """Resolve a working directory for MCP servers and create it if needed."""
+    cwd = config.cwd
+    if not cwd and name == "playwright":
+        cwd = "./artifacts/playwright"
+    if not cwd:
+        return None
+
+    path = Path(cwd).expanduser()
+    if not path.is_absolute():
+        path = Path.cwd() / path
+    if name == "playwright":
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        path = path / timestamp
+    path.mkdir(parents=True, exist_ok=True)
+    return str(path.resolve())
 
 
 def create_mcp_servers(profile: ProjectProfile) -> list[MCPServerStdio]:

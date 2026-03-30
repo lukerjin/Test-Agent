@@ -9,11 +9,13 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from agents import Runner
+from agents import RunConfig, Runner
 from agents.mcp import MCPServerStdio
 
 from universal_debug_agent.agents.brain import create_brain_agent
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
+from universal_debug_agent.orchestrator.input_filters import MCPToolOutputFilter
+from universal_debug_agent.observability.llm_usage import LLMUsageTracker
 from universal_debug_agent.schemas.profile import ProjectProfile
 from universal_debug_agent.schemas.report import (
     ReportMetadata,
@@ -22,6 +24,11 @@ from universal_debug_agent.schemas.report import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_RUN_CONFIG = RunConfig(
+    call_model_input_filter=MCPToolOutputFilter(),
+)
 
 
 class InvestigationState(Enum):
@@ -136,11 +143,13 @@ class InvestigationOrchestrator:
         mcp_servers: list[MCPServerStdio],
         model: Any = None,
         memory_context: str = "",
+        usage_tracker: LLMUsageTracker | None = None,
     ):
         self.profile = profile
         self.mcp_servers = mcp_servers
         self.model = model
         self.memory_context = memory_context
+        self.usage_tracker = usage_tracker
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(max_steps=profile.boundaries.max_steps)
         self.evidence_collector = EvidenceCollector()
@@ -188,7 +197,14 @@ class InvestigationOrchestrator:
         )
 
         try:
-            result = await Runner.run(react_agent, scenario, hooks=hooks)
+            result = await Runner.run(
+                react_agent,
+                scenario,
+                hooks=hooks,
+                run_config=_RUN_CONFIG,
+            )
+            if self.usage_tracker is not None:
+                self.usage_tracker.record_run_result(result, phase="react")
 
             # Try to parse the output as a report
             return self._extract_report(result)
@@ -218,7 +234,13 @@ class InvestigationOrchestrator:
             f"Total steps taken: {self.stuck_detector.step_count}"
         )
 
-        result = await Runner.run(analysis_agent, analysis_input)
+        result = await Runner.run(
+            analysis_agent,
+            analysis_input,
+            run_config=_RUN_CONFIG,
+        )
+        if self.usage_tracker is not None:
+            self.usage_tracker.record_run_result(result, phase="analysis")
         return self._extract_report(result)
 
     def _extract_report(self, result) -> ScenarioReport:

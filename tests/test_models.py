@@ -1,13 +1,15 @@
 """Tests for model factory."""
 
+import json
 import os
 from unittest.mock import patch
 
 import pytest
+import httpx
 
 from agents.models.openai_chatcompletions import OpenAIChatCompletionsModel
 
-from universal_debug_agent.models.factory import create_model
+from universal_debug_agent.models.factory import _CompatTransport, create_model
 from universal_debug_agent.schemas.profile import ModelConfig
 
 
@@ -83,3 +85,37 @@ def test_profile_model_defaults():
     assert config.model_name is None
     assert config.api_key_env is None
     assert config.base_url is None
+
+
+@pytest.mark.asyncio
+async def test_compat_transport_rewrites_content_length():
+    captured_request = None
+
+    class DummyTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            nonlocal captured_request
+            captured_request = request
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+    original_body = {
+        "model": "gemini-2.0-flash",
+        "parallel_tool_calls": True,
+        "tools": [{"type": "function", "function": {"name": "noop", "strict": True}}],
+    }
+    original_content = json.dumps(original_body).encode()
+    request = httpx.Request(
+        "POST",
+        "https://example.com/chat/completions",
+        headers={"Content-Length": str(len(original_content))},
+        content=original_content,
+    )
+
+    transport = _CompatTransport(DummyTransport())
+    await transport.handle_async_request(request)
+
+    assert captured_request is not None
+
+    rewritten_body = json.loads(captured_request.content)
+    assert "parallel_tool_calls" not in rewritten_body
+    assert rewritten_body["tools"][0]["function"].get("strict") is None
+    assert captured_request.headers["Content-Length"] == str(len(captured_request.content))
