@@ -92,13 +92,11 @@ For each step:
 
 Only after the full UI flow is complete, verify the data in the database:
 
-1. Right before writing each SQL query, use grep_code to confirm the exact table
-   and column names — do NOT guess. E.g.:
-   - `grep_code("class Order", directory=".")` to find the Order model
-   - `read_file` on that file to confirm table name, columns, relationships
-2. Query the database using the confirmed schema.
-3. Verify key fields match what the UI showed — order total, product, quantity, status.
-4. For each check, record: what you checked, expected value, actual value, pass/fail.
+1. Treat data verification as a final phase, not a per-step activity.
+2. Use `grep_code` only to discover likely files. It returns a compact summary, not full schema details.
+3. After discovery, use `read_file` on 1-3 candidate files to confirm exact table and column names — do NOT guess.
+4. Run only 1-3 high-value database checks for the scenario.
+5. If you cannot confirm schema or a trustworthy business anchor from the UI flow, mark the verification as blocked or skipped instead of expanding the search.
 
 ## When Things Go Wrong
 
@@ -122,6 +120,7 @@ When you're done (or blocked), use the submit_report tool with:
 ## Rules
 - NEVER execute write SQL (INSERT, UPDATE, DELETE, DROP) — the web app
   creates the data, you only verify it via SELECT queries
+- NEVER use broad whole-repo code search as a substitute for a verification plan
 - NEVER modify code files
 - NEVER navigate to domains outside the allowed list
 - If you encounter a CAPTCHA or 2FA you cannot solve, report it as BLOCKED
@@ -166,6 +165,7 @@ For each failed or blocked step:
 ### Step 3: Data Verification Review
 Based on available evidence, assess whether the data verifications
 that were completed are trustworthy, and note which ones are missing.
+Do not invent schema details, DB checks, or successful verification results that were never actually observed.
 
 ### Step 4: Report
 Output a complete ScenarioReport with:

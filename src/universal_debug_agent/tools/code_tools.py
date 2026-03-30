@@ -7,9 +7,8 @@ the project's code.root_dir.
 
 from __future__ import annotations
 
-import fnmatch
-import os
 import subprocess
+from collections import defaultdict
 from pathlib import Path
 
 from agents import function_tool
@@ -18,7 +17,9 @@ from agents import function_tool
 _root_dir: str = ""
 
 MAX_READ_LINES = 200
-MAX_GREP_RESULTS = 50
+MAX_GREP_FILES = 8
+MAX_GREP_MATCHES_PER_FILE = 2
+MAX_GREP_OUTPUT_CHARS = 2500
 
 
 def configure(root_dir: str) -> None:
@@ -65,9 +66,64 @@ def read_file(path: str, start_line: int = 1, end_line: int = 200) -> str:
     return header + "\n" + "\n".join(numbered)
 
 
+def _format_grep_discovery(
+    lines: list[str],
+    *,
+    pattern: str,
+    directory: str,
+    file_glob: str,
+    root_dir: str,
+) -> str:
+    if not lines:
+        return f"No matches for pattern: {pattern}"
+
+    root_str = str(Path(root_dir).resolve())
+    grouped: dict[str, list[str]] = defaultdict(list)
+
+    for line in lines:
+        normalized = line.replace(root_str + "/", "")
+        file_path, sep, remainder = normalized.partition(":")
+        if not sep:
+            continue
+        grouped[file_path].append(remainder)
+
+    file_paths = sorted(grouped)
+    summary_lines = [
+        "# grep_code discovery summary",
+        f"pattern: {pattern}",
+        f"directory: {directory or '.'}",
+        f"file_glob: {file_glob}",
+        f"matched_files: {len(file_paths)}",
+    ]
+
+    if len(file_paths) > MAX_GREP_FILES:
+        summary_lines.append(
+            f"note: too many matching files; showing top {MAX_GREP_FILES}. Narrow directory or file_glob before reading files."
+        )
+
+    for file_path in file_paths[:MAX_GREP_FILES]:
+        matches = grouped[file_path]
+        summary_lines.append(f"\n- {file_path} ({len(matches)} matches)")
+        for match in matches[:MAX_GREP_MATCHES_PER_FILE]:
+            line_no, _, text = match.partition(":")
+            compact = " ".join(text.strip().split())
+            summary_lines.append(f"  {line_no}: {compact[:160]}")
+        if len(matches) > MAX_GREP_MATCHES_PER_FILE:
+            summary_lines.append(
+                f"  ... {len(matches) - MAX_GREP_MATCHES_PER_FILE} more matches in this file"
+            )
+
+    output = "\n".join(summary_lines)
+    if len(output) > MAX_GREP_OUTPUT_CHARS:
+        output = output[: MAX_GREP_OUTPUT_CHARS - 120].rstrip()
+        output += "\n\nnote: search summary truncated; narrow the search before reading files."
+
+    return output
+
+
 @function_tool
 def grep_code(pattern: str, directory: str = "", file_glob: str = "*") -> str:
-    """Search for a pattern in code files using grep.
+    """Search for a pattern in code files using ripgrep and return compact discovery results.
 
     Args:
         pattern: Regex pattern to search for.
@@ -80,29 +136,30 @@ def grep_code(pattern: str, directory: str = "", file_glob: str = "*") -> str:
 
     try:
         result = subprocess.run(
-            ["grep", "-rn", "--include", file_glob, "-E", pattern, str(search_dir)],
+            [
+                "rg",
+                "--line-number",
+                "--with-filename",
+                "--glob",
+                file_glob,
+                "--regexp",
+                pattern,
+                str(search_dir),
+            ],
             capture_output=True,
             text=True,
             timeout=10,
         )
     except subprocess.TimeoutExpired:
-        return "Error: grep timed out after 10s"
+        return "Error: code search timed out after 10s"
 
-    lines = result.stdout.strip().splitlines()
-    if not lines:
-        return f"No matches for pattern: {pattern}"
-
-    # Make paths relative to root
-    root_str = str(Path(_root_dir).resolve())
-    output_lines: list[str] = []
-    for line in lines[:MAX_GREP_RESULTS]:
-        output_lines.append(line.replace(root_str + "/", ""))
-
-    suffix = ""
-    if len(lines) > MAX_GREP_RESULTS:
-        suffix = f"\n... ({len(lines) - MAX_GREP_RESULTS} more matches)"
-
-    return "\n".join(output_lines) + suffix
+    return _format_grep_discovery(
+        lines=result.stdout.strip().splitlines(),
+        pattern=pattern,
+        directory=directory,
+        file_glob=file_glob,
+        root_dir=_root_dir,
+    )
 
 
 @function_tool
