@@ -92,13 +92,20 @@ For each step:
 
 After completing the business flow, you MUST verify the data:
 
-1. Query the database to check the expected records exist
-   - Example: "SELECT * FROM orders WHERE user_id = X ORDER BY created_at DESC LIMIT 1"
-2. Verify key fields match what was shown on the UI
+1. **Find the schema first — do NOT guess column or table names.**
+   Use code tools to locate the relevant Model or migration file before writing any SQL:
+   - `grep_code("class Order", directory=".")` — find the Order model
+   - `grep_code("create_table", file_glob="*migration*")` — find migrations
+   - `grep_code("orders", file_glob="*.php")` — find ORM definitions
+   Read the file to confirm actual table name, column names, and relationships.
+
+2. Query the database using the confirmed schema to check the expected records exist.
+
+3. Verify key fields match what was shown on the UI
    - Order total, product name, quantity, status, etc.
-3. Check related tables if applicable
-   - order_items, payments, inventory, user balance, etc.
-4. For each check, record: what you checked, expected value, actual value, pass/fail
+4. Check related tables if applicable
+   - Use grep_code to find those models/migrations too before querying.
+5. For each check, record: what you checked, expected value, actual value, pass/fail
 
 ## When Things Go Wrong
 
