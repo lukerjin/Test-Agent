@@ -22,7 +22,9 @@ def test_minimal_profile():
     profile = ProjectProfile.model_validate(data)
     assert profile.project.name == "Test"
     assert profile.environment.type == "web"
-    assert profile.boundaries.max_steps == 30
+    assert profile.boundaries.max_steps == 40
+    assert profile.boundaries.max_turns == 20
+    assert profile.boundaries.stuck_budget_ratio == 0.85
     assert profile.boundaries.readonly is True
 
 
@@ -52,6 +54,8 @@ def test_full_profile():
                 "enabled": True,
                 "command": "npx",
                 "args": ["@anthropic-ai/mcp-playwright"],
+                "cache_tools_list": True,
+                "client_session_timeout_seconds": 15,
             },
             "database": {
                 "enabled": False,
@@ -63,6 +67,8 @@ def test_full_profile():
         "boundaries": {
             "readonly": True,
             "max_steps": 20,
+            "max_turns": 12,
+            "stuck_budget_ratio": 0.9,
             "allowed_domains": ["test.example.com"],
         },
     }
@@ -70,8 +76,12 @@ def test_full_profile():
     assert profile.project.description == "A full test app"
     assert len(profile.auth.test_accounts) == 1
     assert profile.mcp_servers["playwright"].enabled is True
+    assert profile.mcp_servers["playwright"].cache_tools_list is True
+    assert profile.mcp_servers["playwright"].client_session_timeout_seconds == 15
     assert profile.mcp_servers["database"].enabled is False
     assert profile.boundaries.max_steps == 20
+    assert profile.boundaries.max_turns == 12
+    assert profile.boundaries.stuck_budget_ratio == 0.9
 
 
 def test_test_report_all_pass():

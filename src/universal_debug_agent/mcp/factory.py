@@ -44,6 +44,8 @@ def create_mcp_server(name: str, config: MCPServerConfig) -> MCPServerStdio:
     return MCPServerStdio(
         params=params,
         name=name,
+        cache_tools_list=config.cache_tools_list,
+        client_session_timeout_seconds=config.client_session_timeout_seconds,
     )
 
 

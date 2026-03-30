@@ -25,7 +25,7 @@ auth:
 # Option 1: OpenAI (default)
 model:
   provider: "openai"
-  model_name: "gpt-4o"
+  model_name: "gpt-5.4-nano"
   # api_key_env: "OPENAI_API_KEY"  # default, auto-detected
 
 # Option 2: Gemini (free tier available)
@@ -50,8 +50,8 @@ model:
 # --- Memory ---
 memory:
   enabled: true
-  path: "./memory/{project_name}.jsonl"   # auto-creates, per-project file
-  max_entries_in_prompt: 20               # inject last N records into prompt
+  path: "./memory/{project_name}.jsonl" # auto-creates, per-project file
+  max_entries_in_prompt: 2 # inject last N records into prompt
 
 code:
   root_dir: "/path/to/your/project"
@@ -69,10 +69,14 @@ mcp_servers:
     enabled: true
     command: "npx"
     args: ["@playwright/mcp@latest"]
+    cwd: "./artifacts/playwright"
+    cache_tools_list: true
+    client_session_timeout_seconds: 15
   database:
     enabled: true
     command: "node"
     args: ["./path/to/your/db-mcp/index.js"]
+    cache_tools_list: true
     env:
       DB_HOST_ENV: "DB_HOST"
       DB_PORT_ENV: "DB_PORT"
@@ -87,6 +91,8 @@ boundaries:
     - "DROP TABLE"
     - "INSERT INTO"
     - "UPDATE"
-  max_steps: 30
+  max_steps: 40
+  max_turns: 20
+  stuck_budget_ratio: 0.85
   allowed_domains:
     - "staging.example.com"

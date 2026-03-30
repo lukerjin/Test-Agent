@@ -52,8 +52,9 @@ class StuckDetector:
     REPEAT_THRESHOLD = 3
     SAME_RESULT_WINDOW = 5
 
-    def __init__(self, max_steps: int):
+    def __init__(self, max_steps: int, stuck_budget_ratio: float = 0.85):
         self.max_steps = max_steps
+        self.stuck_budget_ratio = stuck_budget_ratio
         self.history: list[ToolCall] = []
         self._stuck_reason: str = ""
 
@@ -93,7 +94,7 @@ class StuckDetector:
                 return True
 
         # Rule 3: used > 70% of budget with no report submitted
-        budget_threshold = int(self.max_steps * 0.7)
+        budget_threshold = int(self.max_steps * self.stuck_budget_ratio)
         if self.step_count > budget_threshold:
             has_report = any(tc.name == "submit_report" for tc in self.history)
             if not has_report:
@@ -157,7 +158,10 @@ class InvestigationOrchestrator:
         self.last_raw_output_path: str = ""
         self.last_error_output_path: str = ""
         self.state = InvestigationState.REACT
-        self.stuck_detector = StuckDetector(max_steps=profile.boundaries.max_steps)
+        self.stuck_detector = StuckDetector(
+            max_steps=profile.boundaries.max_steps,
+            stuck_budget_ratio=profile.boundaries.stuck_budget_ratio,
+        )
         self.evidence_collector = EvidenceCollector()
 
     async def run(self, scenario: str) -> ScenarioReport:
@@ -175,6 +179,8 @@ class InvestigationOrchestrator:
         try:
             return await self._run_pipeline(scenario)
         except BaseException as e:
+            if self.usage_tracker is not None:
+                self.usage_tracker.record_error(e, phase=self.state.value)
             if self.usage_tracker is not None:
                 error_path = self.usage_tracker.write_error_output(e)
                 self.last_error_output_path = str(error_path) if error_path else ""
@@ -212,6 +218,7 @@ class InvestigationOrchestrator:
             result = await Runner.run(
                 react_agent,
                 scenario,
+                max_turns=self.profile.boundaries.max_turns,
                 hooks=hooks,
                 run_config=_RUN_CONFIG,
             )
@@ -271,6 +278,7 @@ class InvestigationOrchestrator:
         result = await Runner.run(
             analysis_agent,
             analysis_input,
+            max_turns=self.profile.boundaries.max_turns,
             run_config=_RUN_CONFIG,
         )
         if self.usage_tracker is not None:

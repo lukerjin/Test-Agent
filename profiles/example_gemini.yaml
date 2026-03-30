@@ -18,9 +18,25 @@ environment:
 auth:
   method: "none"
 
+memory:
+  enabled: true
+  path: "./memory/{project_name}.jsonl"
+  max_entries_in_prompt: 20
+
 code:
   root_dir: "/path/to/your/project"
 
+mcp_servers:
+  playwright:
+    enabled: true
+    command: "npx"
+    args: ["@playwright/mcp@latest"]
+    cwd: "./artifacts/playwright"
+    cache_tools_list: true
+    client_session_timeout_seconds: 15
+
 boundaries:
   readonly: true
-  max_steps: 30
+  max_steps: 40
+  max_turns: 20
+  stuck_budget_ratio: 0.85

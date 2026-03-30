@@ -42,6 +42,8 @@ class MCPServerConfig(BaseModel):
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
     cwd: str | None = None
+    client_session_timeout_seconds: float | None = None
+    cache_tools_list: bool = True
 
 
 class ModelConfig(BaseModel):
@@ -66,7 +68,9 @@ class BoundariesConfig(BaseModel):
     forbidden_actions: list[str] = Field(
         default_factory=lambda: ["DELETE FROM", "DROP TABLE", "INSERT INTO", "UPDATE"]
     )
-    max_steps: int = 30
+    max_steps: int = 40
+    max_turns: int = 20
+    stuck_budget_ratio: float = Field(default=0.85, ge=0.5, le=1.0)
     allowed_domains: list[str] = Field(default_factory=list)
 
 
