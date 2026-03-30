@@ -67,6 +67,8 @@ class JsonlUsageStore:
         self.root_dir.mkdir(parents=True, exist_ok=True)
         self.calls_path = self.root_dir / "llm_calls.jsonl"
         self.summaries_path = self.root_dir / "llm_runs.jsonl"
+        self.runs_root = self.root_dir / "runs"
+        self.runs_root.mkdir(parents=True, exist_ok=True)
 
     def write_call(self, record: LLMCallRecord) -> None:
         self._append(self.calls_path, record.model_dump())
@@ -77,6 +79,11 @@ class JsonlUsageStore:
     def _append(self, path: Path, payload: dict) -> None:
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+    def run_dir(self, run_id: str) -> Path:
+        path = self.runs_root / run_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 
 class MySQLUsageStore:
@@ -176,6 +183,29 @@ class LLMUsageTracker:
         )
         self.store.write_summary(summary)
         return summary
+
+    def write_final_output(self, final_output: object) -> Path | None:
+        if not isinstance(self.store, JsonlUsageStore):
+            return None
+
+        run_dir = self.store.run_dir(self.run_id)
+        suffix = "json" if isinstance(final_output, dict) else "txt"
+        path = run_dir / f"final_output.{suffix}"
+        if isinstance(final_output, dict):
+            payload = json.dumps(final_output, ensure_ascii=False, indent=2)
+        else:
+            payload = str(final_output)
+        path.write_text(payload, encoding="utf-8")
+        return path
+
+    def write_error_output(self, error: BaseException) -> Path | None:
+        if not isinstance(self.store, JsonlUsageStore):
+            return None
+
+        run_dir = self.store.run_dir(self.run_id)
+        path = run_dir / "error.txt"
+        path.write_text(str(error), encoding="utf-8")
+        return path
 
 
 def default_usage_dir(project_name: str) -> str:

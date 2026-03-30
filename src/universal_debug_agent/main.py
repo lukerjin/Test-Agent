@@ -31,6 +31,7 @@ from universal_debug_agent.observability.llm_usage import (
     LLMUsageTracker,
     default_usage_dir,
 )
+from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
 from universal_debug_agent.orchestrator.state_machine import InvestigationOrchestrator
 from universal_debug_agent.tools.auth_tools import configure_test_accounts, resolve_test_accounts
 from universal_debug_agent.tools import code_tools
@@ -157,6 +158,9 @@ async def _run_test(
         model=model_desc,
         store=JsonlUsageStore(usage_dir),
     )
+    trace_recorder = ExecutionTraceRecorder(
+        Path(usage_dir) / "runs" / usage_tracker.run_id
+    )
     console.print(f"[green]LLM usage:[/green] {usage_dir}")
 
     # Run test
@@ -168,10 +172,17 @@ async def _run_test(
         model=model,
         memory_context=memory_context,
         usage_tracker=usage_tracker,
+        trace_recorder=trace_recorder,
     )
 
     try:
         report = await orchestrator.run(scenario)
+    except Exception:
+        if orchestrator.last_error_output_path:
+            console.print(f"[dim]Run error output: {orchestrator.last_error_output_path}[/dim]")
+        if orchestrator.last_raw_output_path:
+            console.print(f"[dim]Raw final output: {orchestrator.last_raw_output_path}[/dim]")
+        raise
     finally:
         usage_summary = usage_tracker.write_summary()
 
@@ -203,6 +214,9 @@ async def _run_test(
         f"tokens in/out/total: "
         f"{usage_summary.input_tokens}/{usage_summary.output_tokens}/{usage_summary.total_tokens}[/dim]"
     )
+    if orchestrator.last_raw_output_path:
+        console.print(f"[dim]Raw final output: {orchestrator.last_raw_output_path}[/dim]")
+    console.print(f"[dim]Execution trace: {trace_recorder.md_path}[/dim]")
 
     # Output report
     report_json = report.model_dump_json(indent=2)
@@ -307,6 +321,9 @@ def test(
             border_style="red",
         ))
         raise typer.Exit(1) from None
+    except Exception as e:
+        console.print(f"[red]Run failed:[/red] {e}")
+        raise
 
 
 @app.command()

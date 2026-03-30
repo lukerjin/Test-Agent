@@ -10,12 +10,14 @@ from enum import Enum
 from typing import Any
 
 from agents import RunConfig, Runner
+from agents.exceptions import MaxTurnsExceeded
 from agents.mcp import MCPServerStdio
 
 from universal_debug_agent.agents.brain import create_brain_agent
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
 from universal_debug_agent.orchestrator.input_filters import MCPToolOutputFilter
 from universal_debug_agent.observability.llm_usage import LLMUsageTracker
+from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
 from universal_debug_agent.schemas.profile import ProjectProfile
 from universal_debug_agent.schemas.report import (
     ReportMetadata,
@@ -144,12 +146,16 @@ class InvestigationOrchestrator:
         model: Any = None,
         memory_context: str = "",
         usage_tracker: LLMUsageTracker | None = None,
+        trace_recorder: ExecutionTraceRecorder | None = None,
     ):
         self.profile = profile
         self.mcp_servers = mcp_servers
         self.model = model
         self.memory_context = memory_context
         self.usage_tracker = usage_tracker
+        self.trace_recorder = trace_recorder
+        self.last_raw_output_path: str = ""
+        self.last_error_output_path: str = ""
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(max_steps=profile.boundaries.max_steps)
         self.evidence_collector = EvidenceCollector()
@@ -168,6 +174,11 @@ class InvestigationOrchestrator:
 
         try:
             return await self._run_pipeline(scenario)
+        except BaseException as e:
+            if self.usage_tracker is not None:
+                error_path = self.usage_tracker.write_error_output(e)
+                self.last_error_output_path = str(error_path) if error_path else ""
+            raise
         finally:
             # Disconnect all MCP servers (suppress all errors to preserve original exception)
             for server in self.mcp_servers:
@@ -186,6 +197,7 @@ class InvestigationOrchestrator:
         hooks = InvestigationHooks(
             stuck_detector=self.stuck_detector,
             evidence_collector=self.evidence_collector,
+            trace_recorder=self.trace_recorder,
         )
 
         react_agent = create_brain_agent(
@@ -205,6 +217,8 @@ class InvestigationOrchestrator:
             )
             if self.usage_tracker is not None:
                 self.usage_tracker.record_run_result(result, phase="react")
+                raw_path = self.usage_tracker.write_final_output(result.final_output)
+                self.last_raw_output_path = str(raw_path) if raw_path else ""
 
             # Try to parse the output as a report
             return self._extract_report(result)
@@ -212,6 +226,20 @@ class InvestigationOrchestrator:
         except SwitchToAnalysisMode as e:
             logger.info(f"Switching to analysis mode: {e.reason}")
             return await self._run_analysis(scenario, e.evidence_summary)
+        except MaxTurnsExceeded as e:
+            reason = str(e)
+            logger.warning(f"Switching to analysis mode: {reason}")
+            if self.trace_recorder is not None:
+                self.trace_recorder.record("mode_switch", "Switch To Analysis", reason)
+            return await self._run_analysis(scenario, self.evidence_collector.build_summary())
+        except BaseException as e:
+            mode_switch = self._unwrap_mode_switch(e)
+            if mode_switch is not None:
+                logger.info(f"Switching to analysis mode: {mode_switch.reason}")
+                if self.trace_recorder is not None:
+                    self.trace_recorder.record("mode_switch", "Switch To Analysis", mode_switch.reason)
+                return await self._run_analysis(scenario, mode_switch.evidence_summary)
+            raise
 
     async def _run_analysis(self, scenario: str, evidence_summary: str) -> ScenarioReport:
         """Phase 2: Analysis mode — analyze what happened when agent got stuck."""
@@ -233,6 +261,12 @@ class InvestigationOrchestrator:
             f"Please analyze the execution log and produce a final test report.\n\n"
             f"Total steps taken: {self.stuck_detector.step_count}"
         )
+        if self.trace_recorder is not None:
+            self.trace_recorder.record(
+                "analysis_start",
+                "Analysis Mode",
+                analysis_input[:2000],
+            )
 
         result = await Runner.run(
             analysis_agent,
@@ -241,7 +275,19 @@ class InvestigationOrchestrator:
         )
         if self.usage_tracker is not None:
             self.usage_tracker.record_run_result(result, phase="analysis")
+            raw_path = self.usage_tracker.write_final_output(result.final_output)
+            self.last_raw_output_path = str(raw_path) if raw_path else ""
         return self._extract_report(result)
+
+    def _unwrap_mode_switch(self, error: BaseException) -> SwitchToAnalysisMode | None:
+        current: BaseException | None = error
+        seen: set[int] = set()
+        while current is not None and id(current) not in seen:
+            if isinstance(current, SwitchToAnalysisMode):
+                return current
+            seen.add(id(current))
+            current = current.__cause__ or current.__context__
+        return None
 
     def _extract_report(self, result) -> ScenarioReport:
         """Extract ScenarioReport from Runner result."""
@@ -254,11 +300,14 @@ class InvestigationOrchestrator:
                 report = ScenarioReport.model_validate_json(result.final_output)
             except Exception:
                 # Fallback: create a minimal report from the text
+                next_steps = ["Review the raw agent output for details"]
+                if self.last_raw_output_path:
+                    next_steps.append(f"Raw output saved to: {self.last_raw_output_path}")
                 report = ScenarioReport(
                     scenario_summary="Test execution completed (unstructured output)",
                     overall_status=StepStatus.FAIL,
                     issues_found=["Agent output could not be parsed as structured report"],
-                    next_steps=["Review the raw agent output for details"],
+                    next_steps=next_steps,
                 )
         else:
             report = ScenarioReport(
