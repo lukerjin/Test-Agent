@@ -34,7 +34,9 @@ def build_react_prompt(profile: ProjectProfile, memory_context: str = "") -> str
 - **Login URL**: {profile.auth.login_url}
 - **Available test accounts**: {', '.join(a.role for a in profile.auth.test_accounts)}
 - When a step requires login and you are not logged in, handle it automatically:
-  use the appropriate test account, complete the login flow, then continue."""
+  use the appropriate test account, complete the login flow, then continue.
+- To retrieve real credentials, call `get_test_account(role)` with one of the
+  available roles. Do NOT guess usernames or passwords."""
 
     # Build boundaries section
     boundaries_ctx = f"""

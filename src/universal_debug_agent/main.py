@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -14,6 +15,8 @@ from dotenv import load_dotenv
 load_dotenv()  # Load .env before anything reads os.environ
 
 import typer
+from agents.tracing import set_tracing_disabled
+from openai import APIStatusError, RateLimitError
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -23,14 +26,74 @@ from universal_debug_agent.config import load_profile
 from universal_debug_agent.mcp.factory import create_mcp_servers
 from universal_debug_agent.memory.store import MemoryRecord, MemoryStore, resolve_memory_path
 from universal_debug_agent.models.factory import create_model
+from universal_debug_agent.observability.llm_usage import (
+    JsonlUsageStore,
+    LLMUsageTracker,
+    default_usage_dir,
+)
 from universal_debug_agent.orchestrator.state_machine import InvestigationOrchestrator
+from universal_debug_agent.tools.auth_tools import configure_test_accounts, resolve_test_accounts
 from universal_debug_agent.tools import code_tools
+
+if not os.environ.get("OPENAI_API_KEY"):
+    set_tracing_disabled(True)
 
 app = typer.Typer(
     name="test-agent",
     help="Universal Test Agent — execute test scenarios and verify data across any project.",
 )
 console = Console()
+
+
+def _extract_retry_delay(error: Exception) -> str | None:
+    response = getattr(error, "response", None)
+    if response is None:
+        return None
+
+    try:
+        payload = response.json()
+    except Exception:
+        return None
+
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+
+    if not isinstance(payload, dict):
+        return None
+
+    details = payload.get("error", {}).get("details", [])
+    for detail in details:
+        if isinstance(detail, dict) and detail.get("@type", "").endswith("RetryInfo"):
+            retry_delay = detail.get("retryDelay")
+            if retry_delay:
+                return str(retry_delay)
+    return None
+
+
+def _format_api_error(error: Exception, provider: str) -> str:
+    if isinstance(error, RateLimitError):
+        retry_delay = _extract_retry_delay(error)
+        lines = [
+            f"{provider} API 返回 429，当前配额或限流已触发。",
+            "",
+            "常见原因：",
+            "1. 当前 key 对应项目的免费额度已耗尽。",
+            "2. 当前模型的每分钟请求数或 token 数超限。",
+            "3. 该项目尚未开通可用 billing，导致 quota 为 0。",
+            "",
+            "建议处理：",
+            "1. 去 Google AI Studio / GCP 检查 Gemini API quota 和 billing。",
+            "2. 换一个有额度的 key 或项目。",
+            "3. 暂时切到其他 provider，例如 openai / deepseek / groq。",
+        ]
+        if retry_delay:
+            lines.append(f"4. 服务端建议至少等待 {retry_delay} 后重试。")
+        return "\n".join(lines)
+
+    if isinstance(error, APIStatusError):
+        return f"{provider} API 请求失败，HTTP {error.status_code}。{error}"
+
+    return str(error)
 
 
 async def _run_test(
@@ -58,6 +121,7 @@ async def _run_test(
 
     # Configure code tools with the project root
     code_tools.configure(profile.code.root_dir)
+    configure_test_accounts(resolve_test_accounts(profile.auth.test_accounts))
 
     # Create model
     model = create_model(profile.model)
@@ -85,6 +149,16 @@ async def _run_test(
     else:
         console.print("[yellow]No MCP servers configured[/yellow]")
 
+    usage_dir = default_usage_dir(profile.project.name)
+    usage_tracker = LLMUsageTracker(
+        project_name=profile.project.name,
+        scenario=scenario,
+        provider=profile.model.provider,
+        model=model_desc,
+        store=JsonlUsageStore(usage_dir),
+    )
+    console.print(f"[green]LLM usage:[/green] {usage_dir}")
+
     # Run test
     console.print(Panel(scenario, title="Test Scenario", border_style="blue"))
 
@@ -93,9 +167,13 @@ async def _run_test(
         mcp_servers=mcp_servers,
         model=model,
         memory_context=memory_context,
+        usage_tracker=usage_tracker,
     )
 
-    report = await orchestrator.run(scenario)
+    try:
+        report = await orchestrator.run(scenario)
+    finally:
+        usage_summary = usage_tracker.write_summary()
 
     # Save to memory
     if memory_store is not None:
@@ -120,6 +198,11 @@ async def _run_test(
 
     # Print summary table
     _print_summary(report)
+    console.print(
+        f"[dim]LLM calls: {usage_summary.call_count}, "
+        f"tokens in/out/total: "
+        f"{usage_summary.input_tokens}/{usage_summary.output_tokens}/{usage_summary.total_tokens}[/dim]"
+    )
 
     # Output report
     report_json = report.model_dump_json(indent=2)
@@ -203,13 +286,27 @@ def test(
         console.print("[red]Error: provide --scenario / -s[/red]")
         raise typer.Exit(1)
 
-    asyncio.run(_run_test(
-        profile_path=profile,
-        scenario=scenario,
-        output=output,
-        max_steps=max_steps,
-        verbose=verbose,
-    ))
+    try:
+        asyncio.run(_run_test(
+            profile_path=profile,
+            scenario=scenario,
+            output=output,
+            max_steps=max_steps,
+            verbose=verbose,
+        ))
+    except (RateLimitError, APIStatusError) as e:
+        provider = "LLM"
+        try:
+            provider = load_profile(profile).model.provider
+        except Exception:
+            pass
+
+        console.print(Panel(
+            _format_api_error(e, provider),
+            title="LLM Request Failed",
+            border_style="red",
+        ))
+        raise typer.Exit(1) from None
 
 
 @app.command()
