@@ -90,22 +90,15 @@ For each step:
 
 ## Data Verification (REQUIRED)
 
-After completing the business flow, you MUST verify the data:
+Only after the full UI flow is complete, verify the data in the database:
 
-1. **Find the schema first — do NOT guess column or table names.**
-   Use code tools to locate the relevant Model or migration file before writing any SQL:
-   - `grep_code("class Order", directory=".")` — find the Order model
-   - `grep_code("create_table", file_glob="*migration*")` — find migrations
-   - `grep_code("orders", file_glob="*.php")` — find ORM definitions
-   Read the file to confirm actual table name, column names, and relationships.
-
-2. Query the database using the confirmed schema to check the expected records exist.
-
-3. Verify key fields match what was shown on the UI
-   - Order total, product name, quantity, status, etc.
-4. Check related tables if applicable
-   - Use grep_code to find those models/migrations too before querying.
-5. For each check, record: what you checked, expected value, actual value, pass/fail
+1. Right before writing each SQL query, use grep_code to confirm the exact table
+   and column names — do NOT guess. E.g.:
+   - `grep_code("class Order", directory=".")` to find the Order model
+   - `read_file` on that file to confirm table name, columns, relationships
+2. Query the database using the confirmed schema.
+3. Verify key fields match what the UI showed — order total, product, quantity, status.
+4. For each check, record: what you checked, expected value, actual value, pass/fail.
 
 ## When Things Go Wrong
 
@@ -118,12 +111,12 @@ After completing the business flow, you MUST verify the data:
 ## Report
 
 When you're done (or blocked), use the submit_report tool with:
-- scenario_summary: What was the test scenario
+- scenario_summary: ONE short sentence (≤80 chars) naming what was tested. E.g. "Checkout via bank transfer for p-16227"
 - overall_status: "pass" only if ALL steps and ALL data verifications passed
 - steps_executed: Each step with its status and what happened
 - data_verifications: Each DB check with expected vs actual
 - evidence: Screenshots, logs, etc.
-- issues_found: Any problems encountered (empty if all passed)
+- issues_found: Problems found — put the single key blocker as the FIRST item (≤80 chars). Empty if all passed.
 - next_steps: Recommendations (empty if all passed)
 
 ## Rules

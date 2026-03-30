@@ -6,7 +6,7 @@ Each record is one past investigation. The store supports:
 - build_prompt_context(): format recent records for prompt injection
 
 File format (one JSON object per line):
-{"issue": "...", "root_cause": "...", "classification": "...", "key_findings": [...], "dead_ends": [...], "timestamp": "..."}
+{"issue": "...", "root_cause": "...", "classification": "...", "key_findings": [...], "timestamp": "..."}
 """
 
 from __future__ import annotations
@@ -28,7 +28,6 @@ class MemoryRecord(BaseModel):
     root_cause: str = ""
     classification: str = "unknown"
     key_findings: list[str] = Field(default_factory=list)
-    dead_ends: list[str] = Field(default_factory=list)
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 
@@ -87,8 +86,6 @@ class MemoryStore:
             entry += f"- **Classification**: {rec.classification}\n"
             if rec.key_findings:
                 entry += f"- **Key Findings**: {'; '.join(rec.key_findings)}\n"
-            if rec.dead_ends:
-                entry += f"- **Dead Ends (avoid these)**: {'; '.join(rec.dead_ends)}\n"
             parts.append(entry)
 
         parts.append(

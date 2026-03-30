@@ -188,22 +188,16 @@ async def _run_test(
 
     # Save to memory
     if memory_store is not None:
-        issues = "; ".join(report.issues_found) if report.issues_found else ""
-        failed_steps = [
-            s.action for s in report.steps_executed if s.status != "pass"
-        ]
-        failed_checks = [
-            v.check_name for v in report.data_verifications if v.status != "pass"
-        ]
+        failed_steps = [s.action for s in report.steps_executed if s.status != "pass"]
+        failed_checks = [v.check_name for v in report.data_verifications if v.status != "pass"]
 
         memory_store.save(MemoryRecord(
             issue=report.scenario_summary,
-            root_cause=issues,
+            root_cause=report.issues_found[0] if report.issues_found else "",
             classification=report.overall_status.value,
             key_findings=[f"Steps: {len(report.steps_executed)}, Verifications: {len(report.data_verifications)}"]
                 + [f"FAIL step: {s}" for s in failed_steps]
                 + [f"FAIL check: {c}" for c in failed_checks],
-            dead_ends=[],
         ))
         console.print("[green]Memory updated[/green]")
 
