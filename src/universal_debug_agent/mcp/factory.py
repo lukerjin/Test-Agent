@@ -41,11 +41,18 @@ def create_mcp_server(name: str, config: MCPServerConfig) -> MCPServerStdio:
         params["env"] = env
     if cwd:
         params["cwd"] = cwd
+    tool_filter: dict | None = None
+    if config.allowed_tools:
+        tool_filter = {"allowed_tool_names": config.allowed_tools}
+    elif config.blocked_tools:
+        tool_filter = {"blocked_tool_names": config.blocked_tools}
+
     return MCPServerStdio(
         params=params,
         name=name,
         cache_tools_list=config.cache_tools_list,
         client_session_timeout_seconds=config.client_session_timeout_seconds,
+        tool_filter=tool_filter,
     )
 
 

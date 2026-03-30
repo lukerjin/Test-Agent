@@ -72,6 +72,17 @@ mcp_servers:
     cwd: "./artifacts/playwright"
     cache_tools_list: true
     client_session_timeout_seconds: 15
+    allowed_tools:
+      - browser_navigate
+      - browser_snapshot
+      - browser_click
+      - browser_type
+      - browser_fill_form
+      - browser_select_option
+      - browser_press_key
+      - browser_handle_dialog
+      - browser_wait_for
+      - browser_take_screenshot
   database:
     enabled: true
     command: "node"

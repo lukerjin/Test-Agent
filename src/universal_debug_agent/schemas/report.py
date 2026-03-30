@@ -64,11 +64,13 @@ class ReportMetadata(BaseModel):
 class ScenarioReport(BaseModel):
     """Final structured output of a test scenario execution."""
 
-    scenario_summary: str  # "购买产品 A 的完整流程"
+    scenario_summary: str = Field(
+        description="One short sentence (≤80 chars): what scenario was tested. E.g. 'Checkout via bank transfer for p-16227'"
+    )
     overall_status: StepStatus = StepStatus.PASS  # pass only if ALL steps + verifications pass
     steps_executed: list[ScenarioStep] = Field(default_factory=list)
     data_verifications: list[DataVerification] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
-    issues_found: list[str] = Field(default_factory=list)  # any problems encountered
+    issues_found: list[str] = Field(default_factory=list)  # any problems encountered — first item is the key blocker (≤80 chars)
     next_steps: list[str] = Field(default_factory=list)  # recommendations
     metadata: ReportMetadata = Field(default_factory=ReportMetadata)

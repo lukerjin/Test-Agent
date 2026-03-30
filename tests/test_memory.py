@@ -26,14 +26,12 @@ class TestMemoryStore:
                 root_cause="Session cookie not set",
                 classification="frontend",
                 key_findings=["Cookie header missing in response"],
-                dead_ends=["Not a DNS issue"],
             ))
 
             records = store.load()
             assert len(records) == 1
             assert records[0].issue == "Login page broken"
             assert records[0].root_cause == "Session cookie not set"
-            assert records[0].dead_ends == ["Not a DNS issue"]
 
     def test_append_multiple(self):
         with tempfile.TemporaryDirectory() as d:
@@ -57,15 +55,12 @@ class TestMemoryStore:
                 root_cause="status_map bug",
                 classification="frontend",
                 key_findings=["status_map.ts line 42"],
-                dead_ends=["Not cache related"],
             ))
 
             ctx = store.build_prompt_context()
             assert "Past Investigation Memory" in ctx
             assert "Order status wrong" in ctx
             assert "status_map bug" in ctx
-            assert "Dead Ends (avoid these)" in ctx
-            assert "Not cache related" in ctx
 
     def test_prompt_context_max_entries(self):
         with tempfile.TemporaryDirectory() as d:

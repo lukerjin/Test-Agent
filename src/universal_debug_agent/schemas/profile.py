@@ -44,6 +44,8 @@ class MCPServerConfig(BaseModel):
     cwd: str | None = None
     client_session_timeout_seconds: float | None = None
     cache_tools_list: bool = True
+    allowed_tools: list[str] | None = None   # whitelist — only expose these tools
+    blocked_tools: list[str] | None = None   # blacklist — hide these tools
 
 
 class ModelConfig(BaseModel):
