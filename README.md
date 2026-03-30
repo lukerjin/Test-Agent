@@ -137,17 +137,18 @@ python -m universal_debug_agent test \
    └── 每步记录: step_number, action, status, screenshot
         │
         ▼
-3. 数据验证（流程走完后自动触发）
+3. 数据验证（流程完成或证据足够时触发）
    ├── SELECT * FROM orders WHERE ... → 验证订单存在
    ├── SELECT * FROM order_items WHERE ... → 验证商品正确
    ├── SELECT stock FROM products WHERE ... → 验证库存扣减
    └── SELECT status FROM payments WHERE ... → 验证支付状态
+   注: 如果流程在中途 blocked，可能只输出执行证据、截图和下一步排查建议，数据验证会为空。
         │
         ▼
 4. 卡住检测 (StuckDetector，全程监控)
    ├── 连续 3 次相同操作 → 卡住
    ├── 最近 5 次结果完全相同 → 卡住
-   └── 超过 70% 步数无报告 → 卡住
+   └── 超过配置的预算比例仍无报告 → 卡住
    → 卡住时自动切换 Analysis 模式
      ├── 停止调用工具
      ├── 汇总已执行的步骤和证据
@@ -356,7 +357,7 @@ model:
 # OpenAI
 model:
   provider: "openai"
-  model_name: "gpt-4o"
+  model_name: "gpt-5.4-nano"
 
 # DeepSeek
 model:
@@ -439,7 +440,9 @@ mcp_servers:
   playwright:
     enabled: true
     command: "npx"
-    args: ["@anthropic-ai/mcp-playwright"]
+    args: ["@playwright/mcp@latest"]
+    cwd: "./artifacts/playwright"
+    client_session_timeout_seconds: 15
   database:
     enabled: true
     command: "node"
@@ -450,7 +453,7 @@ mcp_servers:
       DB_PORT_ENV: "DB_PORT"
       DB_USER_ENV: "DB_USER"
       DB_PASSWORD_ENV: "DB_PASSWORD"
-      DB_NAME_ENV: "DB_NAME"
+      DB_ALIASES_ENV: "DB_ALIASES"
 
 # --- 边界 ---
 boundaries:
@@ -460,7 +463,9 @@ boundaries:
     - "DROP TABLE"
     - "INSERT INTO"
     - "UPDATE"
-  max_steps: 30                               # 最大步数
+  max_steps: 40                               # 最大工具步骤数
+  max_turns: 20                               # 最大 LLM turns
+  stuck_budget_ratio: 0.85                    # 超过该比例仍无报告则收口
   allowed_domains:                            # Playwright 可访问的域名
     - "staging.example.com"
 ```
@@ -481,17 +486,42 @@ src/universal_debug_agent/
 │   └── prompts.py       # System prompts (含数据验证指令)
 ├── orchestrator/
 │   ├── state_machine.py # StuckDetector + InvestigationOrchestrator
-│   └── hooks.py         # RunHooks (tool 监控 + 卡住检测)
+│   ├── hooks.py         # RunHooks (tool 监控 + 卡住检测)
+│   └── input_filters.py # MCP 输出过滤：Playwright snapshot 提取 interactive 元素，历史轮次保留语义压缩版本，非 snapshot 输出字符截断兜底
 ├── models/
 │   └── factory.py       # LLM 工厂 (OpenAI/Gemini/DeepSeek/...)
 ├── memory/
 │   └── store.py         # JSONL 记忆存储 (load/save/prompt 注入)
+├── observability/
+│   ├── llm_usage.py     # LLM token usage / per-run usage summary
+│   └── trace_recorder.py # 执行轨迹落盘 (trace.md / trace.jsonl)
 ├── mcp/
 │   └── factory.py       # MCP server 工厂 (Playwright + DB)
 ├── tools/
+│   ├── auth_tools.py    # 测试账号解析与 get_test_account tool
 │   ├── code_tools.py    # 本地代码读取 (read_file, grep_code, list_dir)
 │   └── report_tool.py   # 结构化报告提交
 └── generators/          # [V2] Playwright 脚本生成 + Contract 固化
+```
+
+---
+
+## Token 控制
+
+Playwright 每次 browser 操作都会返回完整的页面 ARIA 树（可达 13,000+ chars / ~3,400 tokens）。随着步骤增加，上下文会线性膨胀，容易触发 TPM（每分钟 token）限额。
+
+`MCPToolOutputFilter` 分两层处理：
+
+1. **Snapshot 语义过滤**（默认开启）：提取 ARIA 树中的 interactive 元素（button、link、textbox、checkbox、radio 等）、状态标记（`[active]`、`[checked]`）、内联文本节点，丢弃纯容器节点和 `[unchanged]` 回引。当前轮和历史轮次都使用过滤后的版本，通常可将单个 snapshot 从 ~13k chars 压缩到 ~2-3k chars。
+2. **字符截断兜底**：非 snapshot 类输出（DB 查询结果、代码文件等）仍按原有字符数上限截断。
+
+关闭 snapshot 过滤（回退到纯字符截断）：
+
+```python
+# src/universal_debug_agent/orchestrator/state_machine.py
+_RUN_CONFIG = RunConfig(
+    call_model_input_filter=MCPToolOutputFilter(snapshot_filter=False),
+)
 ```
 
 ---

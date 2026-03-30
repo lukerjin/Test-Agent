@@ -50,9 +50,11 @@ def test_load_full_profile():
                 "command": "node",
                 "args": ["db.js"],
                 "env": {"DB_HOST_ENV": "HOST"},
+                "cache_tools_list": True,
+                "client_session_timeout_seconds": 12,
             }
         },
-        "boundaries": {"max_steps": 15},
+        "boundaries": {"max_steps": 15, "max_turns": 8, "stuck_budget_ratio": 0.95},
     }
     with tempfile.NamedTemporaryFile(suffix=".yaml", mode="w", delete=False) as f:
         yaml.dump(data, f)
@@ -60,4 +62,8 @@ def test_load_full_profile():
         profile = load_profile(f.name)
         assert profile.environment.type == "api"
         assert profile.boundaries.max_steps == 15
+        assert profile.boundaries.max_turns == 8
+        assert profile.boundaries.stuck_budget_ratio == 0.95
         assert "db" in profile.mcp_servers
+        assert profile.mcp_servers["db"].cache_tools_list is True
+        assert profile.mcp_servers["db"].client_session_timeout_seconds == 12

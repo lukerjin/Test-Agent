@@ -41,7 +41,7 @@ class TestStuckDetector:
         assert "identical results" in sd.stuck_reason()
 
     def test_budget_exceeded(self):
-        sd = StuckDetector(max_steps=10)
+        sd = StuckDetector(max_steps=10, stuck_budget_ratio=0.7)
         # 70% of 10 = 7, so after 8 steps without report -> stuck
         for i in range(8):
             sd.record(f"tool_{i}", f"args_{i}")
@@ -51,7 +51,7 @@ class TestStuckDetector:
         assert "without submitting a report" in sd.stuck_reason()
 
     def test_budget_ok_with_report(self):
-        sd = StuckDetector(max_steps=10)
+        sd = StuckDetector(max_steps=10, stuck_budget_ratio=0.7)
         for i in range(7):
             sd.record(f"tool_{i}", f"args_{i}")
             sd.update_last_result(f"hash_{i}")
@@ -68,6 +68,14 @@ class TestStuckDetector:
         sd.record("a", "b")
         sd.record("c", "d")
         assert sd.step_count == 2
+
+    def test_default_budget_ratio_is_more_permissive(self):
+        sd = StuckDetector(max_steps=10)
+        for i in range(8):
+            sd.record(f"tool_{i}", f"args_{i}")
+            sd.update_last_result(f"hash_{i}")
+
+        assert sd.is_stuck() is False
 
 
 class TestEvidenceCollector:

@@ -36,7 +36,7 @@ def create_brain_agent(
     if mode == "react":
         instructions = build_react_prompt(profile, memory_context=memory_context)
         tools = [read_file, grep_code, list_directory, get_test_account, submit_report]
-        output_type = None
+        output_type = ScenarioReport
         temperature = 0.2
     else:
         instructions = build_analysis_prompt(profile, evidence_summary, memory_context=memory_context)

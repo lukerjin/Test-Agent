@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
 from pydantic import BaseModel, Field
+from openai import APIConnectionError, APIStatusError
 
 from agents.result import RunResult
 from agents.usage import serialize_usage
@@ -34,6 +36,13 @@ class LLMCallRecord(BaseModel):
     total_tokens: int = 0
     cached_tokens: int = 0
     reasoning_tokens: int = 0
+    status: str = "success"
+    error_type: str | None = None
+    error_message: str | None = None
+    status_code: int | None = None
+    rate_limit_limit_tokens: int | None = None
+    rate_limit_used_tokens: int | None = None
+    rate_limit_requested_tokens: int | None = None
     usage: dict = Field(default_factory=dict)
 
 
@@ -51,6 +60,9 @@ class LLMRunSummary(BaseModel):
     total_tokens: int = 0
     cached_tokens: int = 0
     reasoning_tokens: int = 0
+    error_count: int = 0
+    last_error_type: str | None = None
+    last_error_message: str | None = None
 
 
 class UsageStore(Protocol):
@@ -131,6 +143,9 @@ class LLMUsageTracker:
         self._total_tokens = 0
         self._cached_tokens = 0
         self._reasoning_tokens = 0
+        self._error_count = 0
+        self._last_error_type: str | None = None
+        self._last_error_message: str | None = None
 
     def record_run_result(self, result: RunResult, phase: str) -> None:
         self._phases.append(phase)
@@ -180,9 +195,43 @@ class LLMUsageTracker:
             total_tokens=self._total_tokens,
             cached_tokens=self._cached_tokens,
             reasoning_tokens=self._reasoning_tokens,
+            error_count=self._error_count,
+            last_error_type=self._last_error_type,
+            last_error_message=self._last_error_message,
         )
         self.store.write_summary(summary)
         return summary
+
+    def record_error(self, error: BaseException, phase: str) -> None:
+        self._phases.append(phase)
+        self._call_count += 1
+        self._error_count += 1
+        self._last_error_type = type(error).__name__
+        self._last_error_message = str(error)
+
+        limit, used, requested = _extract_rate_limit_metrics(str(error))
+        request_id = getattr(error, "request_id", None)
+        status_code = getattr(error, "status_code", None)
+
+        record = LLMCallRecord(
+            run_id=self.run_id,
+            phase=phase,
+            call_index=self._call_count,
+            project_name=self.project_name,
+            scenario=self.scenario,
+            provider=self.provider,
+            model=self.model,
+            request_id=request_id,
+            status="error",
+            error_type=type(error).__name__,
+            error_message=str(error),
+            status_code=status_code,
+            rate_limit_limit_tokens=limit,
+            rate_limit_used_tokens=used,
+            rate_limit_requested_tokens=requested,
+            usage=_serialize_error_usage(error),
+        )
+        self.store.write_call(record)
 
     def write_final_output(self, final_output: object) -> Path | None:
         if not isinstance(self.store, JsonlUsageStore):
@@ -211,3 +260,27 @@ class LLMUsageTracker:
 def default_usage_dir(project_name: str) -> str:
     safe_name = project_name.lower().replace(" ", "_").replace("/", "_")
     return f"./usage/{safe_name}"
+
+
+def _extract_rate_limit_metrics(message: str) -> tuple[int | None, int | None, int | None]:
+    limit_match = re.search(r"Limit\s+(\d+)", message)
+    used_match = re.search(r"Used\s+(\d+)", message)
+    requested_match = re.search(r"Requested\s+(\d+)", message)
+    limit = int(limit_match.group(1)) if limit_match else None
+    used = int(used_match.group(1)) if used_match else None
+    requested = int(requested_match.group(1)) if requested_match else None
+    return limit, used, requested
+
+
+def _serialize_error_usage(error: BaseException) -> dict:
+    payload = {
+        "error_type": type(error).__name__,
+        "message": str(error),
+    }
+    if isinstance(error, APIStatusError):
+        payload["status_code"] = error.status_code
+        payload["request_id"] = error.request_id
+        payload["body"] = error.body
+    elif isinstance(error, APIConnectionError):
+        payload["body"] = error.body
+    return payload
