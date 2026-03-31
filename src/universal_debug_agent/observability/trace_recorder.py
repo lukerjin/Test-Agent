@@ -42,6 +42,10 @@ class ExecutionTraceRecorder:
             text = ItemHelpers.extract_text(item)
             if text:
                 text_parts.append(text[:1000])
+            elif item_type == "function_call":
+                name = getattr(item, "name", "?")
+                args = getattr(item, "arguments", "") or ""
+                tool_parts.append(f"{name}({args[:300]})")
             elif item_type:
                 tool_parts.append(str(item_type))
 

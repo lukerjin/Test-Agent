@@ -14,9 +14,12 @@ from dotenv import load_dotenv
 
 load_dotenv()  # Load .env before anything reads os.environ
 
+import re
+
 import typer
+from agents import set_default_openai_client
 from agents.tracing import set_tracing_disabled
-from openai import APIStatusError, RateLimitError
+from openai import APIStatusError, AsyncOpenAI, RateLimitError
 from rich.console import Console
 from rich.panel import Panel
 from rich.syntax import Syntax
@@ -38,6 +41,32 @@ from universal_debug_agent.tools import code_tools
 
 if not os.environ.get("OPENAI_API_KEY"):
     set_tracing_disabled(True)
+
+_TAG_RE = re.compile(r"^\[(\w+)\]\s*")
+_TAG_COLORS: dict[str, str] = {
+    "LLM":    "\033[36m",   # cyan
+    "action": "\033[33m",   # yellow
+    "result": "\033[32m",   # green
+    "stuck":  "\033[31m",   # red
+}
+_RESET = "\033[0m"
+
+
+class _TagFormatter(logging.Formatter):
+    """Move [tag] to the front of the log line and colorize it."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        msg = record.getMessage()
+        m = _TAG_RE.match(msg)
+        if m:
+            tag_word = m.group(1)
+            rest = msg[m.end():]
+            color = _TAG_COLORS.get(tag_word, "")
+            tag_str = f"{color}[{tag_word}]{_RESET}"
+            timestamp = self.formatTime(record, self.datefmt)
+            return f"{tag_str:<28} {timestamp} {record.name}: {rest}"
+        return super().format(record)
+
 
 app = typer.Typer(
     name="test-agent",
@@ -106,10 +135,9 @@ async def _run_test(
 ) -> None:
     # Setup logging
     log_level = logging.DEBUG if verbose else logging.INFO
-    logging.basicConfig(
-        level=log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    handler = logging.StreamHandler()
+    handler.setFormatter(_TagFormatter(datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.basicConfig(level=log_level, handlers=[handler], force=True)
 
     # Load profile
     console.print(f"[bold]Loading profile:[/bold] {profile_path}")
@@ -129,16 +157,23 @@ async def _run_test(
     model_desc = profile.model.model_name or profile.model.provider
     console.print(f"[green]Model:[/green] {profile.model.provider} / {model_desc}")
 
+    # For native OpenAI (model is a string), override the default client with max_retries=5
+    # so the SDK handles 429 rate limits with exponential backoff instead of failing fast.
+    if isinstance(model, str):
+        set_default_openai_client(AsyncOpenAI(max_retries=5))
+
     # Load memory
     memory_context = ""
     memory_store = None
     if profile.memory.enabled:
         memory_path = resolve_memory_path(profile.memory.path, profile.project.name)
         memory_store = MemoryStore(memory_path)
+        memory_store.load()
         memory_context = memory_store.build_prompt_context(
-            max_entries=profile.memory.max_entries_in_prompt
+            max_entries=profile.memory.max_entries_in_prompt,
+            scenario=scenario,
         )
-        record_count = len(memory_store.load())
+        record_count = len(memory_store._records)
         console.print(f"[green]Memory:[/green] {memory_path} ({record_count} past records)")
     else:
         console.print("[dim]Memory: disabled[/dim]")
@@ -188,16 +223,12 @@ async def _run_test(
 
     # Save to memory
     if memory_store is not None:
-        failed_steps = [s.action for s in report.steps_executed if s.status != "pass"]
-        failed_checks = [v.check_name for v in report.data_verifications if v.status != "pass"]
-
         memory_store.save(MemoryRecord(
             issue=report.scenario_summary,
             root_cause=report.issues_found[0] if report.issues_found else "",
             classification=report.overall_status.value,
-            key_findings=[f"Steps: {len(report.steps_executed)}, Verifications: {len(report.data_verifications)}"]
-                + [f"FAIL step: {s}" for s in failed_steps]
-                + [f"FAIL check: {c}" for c in failed_checks],
+            lesson=orchestrator.last_lesson,
+            tags=orchestrator.last_lesson_tags,
         ))
         console.print("[green]Memory updated[/green]")
 
@@ -290,9 +321,29 @@ def test(
 ) -> None:
     """Execute a test scenario on the target application."""
 
-    if not scenario:
-        console.print("[red]Error: provide --scenario / -s[/red]")
-        raise typer.Exit(1)
+    # Resolve named scenario from profile
+    try:
+        _profile = load_profile(profile)
+        if scenario and scenario in _profile.scenarios:
+            scenario = _profile.scenarios[scenario]
+        elif not scenario:
+            if _profile.scenarios:
+                table = Table(title="Available Scenarios", show_header=True)
+                table.add_column("Name", style="cyan")
+                table.add_column("Description", style="white")
+                for name, desc in _profile.scenarios.items():
+                    table.add_row(name, desc)
+                console.print(table)
+                console.print("\n[yellow]Run with:[/yellow] -s <name>")
+            else:
+                console.print("[red]Error: provide --scenario / -s[/red]")
+            raise typer.Exit(0)
+    except typer.Exit:
+        raise
+    except Exception:
+        if not scenario:
+            console.print("[red]Error: provide --scenario / -s[/red]")
+            raise typer.Exit(1)
 
     try:
         asyncio.run(_run_test(

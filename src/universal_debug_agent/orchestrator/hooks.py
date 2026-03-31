@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import hashlib
 import logging
+import re
 from typing import Any
 
 from agents import Agent, RunContextWrapper, RunHooks, Tool
@@ -12,6 +13,80 @@ from agents.exceptions import UserError
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
 
 logger = logging.getLogger(__name__)
+
+
+def _compact_jsonish(value: str, limit: int = 180) -> str:
+    compact = " ".join(value.strip().split())
+    return compact[: limit - 3] + "..." if len(compact) > limit else compact
+
+
+def _summarize_llm_response(response) -> str:
+    parts: list[str] = []
+    for item in getattr(response, "output", []):
+        item_type = getattr(item, "type", None)
+        if item_type == "function_call":
+            name = getattr(item, "name", "?")
+            args = getattr(item, "arguments", "") or ""
+            parts.append(f"{name}({_compact_jsonish(args, 120)})")
+        else:
+            text = getattr(item, "text", None)
+            if not text:
+                try:
+                    from agents.items import ItemHelpers
+
+                    text = ItemHelpers.extract_text(item)
+                except Exception:
+                    text = None
+            if text:
+                parts.append(f"text:{_compact_jsonish(text, 120)}")
+    if not parts:
+        return "(no visible output items)"
+    summary = ", ".join(parts[:3])
+    if len(parts) > 3:
+        summary += f", ... (+{len(parts) - 3} more)"
+    return summary
+
+
+def _summarize_tool_result(tool_name: str, result_str: str) -> str:
+    if not result_str:
+        return "(empty)"
+
+    # Strip base64 image data early — never log it
+    result_str_clean = re.sub(
+        r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", "<image>", result_str
+    )
+
+    page_url = re.search(r"- Page URL:\s*(.+)", result_str_clean)
+    if page_url:
+        summary = f"page={page_url.group(1).strip()}"
+        console_info = re.search(r"- Console:\s*(.+)", result_str_clean)
+        if console_info:
+            summary += f"; console={console_info.group(1).strip()}"
+        return summary
+
+    # browser_take_screenshot result starts with page info without "- Page URL:"
+    page_match = re.search(r"page=(\S+)", result_str_clean)
+    if page_match:
+        summary = f"page={page_match.group(1)}"
+        console_info = re.search(r"- Console:\s*(.+)", result_str_clean)
+        if console_info:
+            summary += f"; console={console_info.group(1).strip()}"
+        return summary
+
+    screenshot = re.search(r"\[Screenshot of viewport\]\((.+?)\)", result_str_clean)
+    if screenshot:
+        return f"screenshot={screenshot.group(1)}"
+
+    rows = re.search(r"(\d+\s+rows?\s+returned)", result_str_clean, re.IGNORECASE)
+    if rows:
+        return rows.group(1)
+
+    aliases = re.search(r'"aliases"\s*:\s*{', result_str_clean)
+    if aliases:
+        return "database aliases loaded"
+
+    first_line = result_str_clean.strip().splitlines()[0]
+    return _compact_jsonish(first_line, 180)
 
 
 class SwitchToAnalysisMode(Exception):
@@ -35,12 +110,22 @@ class InvestigationHooks(RunHooks):
         self.stuck_detector = stuck_detector
         self.evidence_collector = evidence_collector
         self.trace_recorder = trace_recorder
+        # Buffer function_call args from LLM responses for use in on_tool_start.
+        # context.tool_arguments is unreliable for MCP tools; the LLM response is authoritative.
+        self._pending_tool_args: dict[str, list[str]] = {}
 
     async def on_llm_end(
         self, context: RunContextWrapper, agent: Agent, response
     ) -> None:
         if self.trace_recorder is not None:
             self.trace_recorder.record_llm_response(response)
+        logger.info(f"[LLM]    {_summarize_llm_response(response)}")
+        for item in response.output:
+            if getattr(item, "type", None) == "function_call":
+                name = getattr(item, "name", None)
+                args = getattr(item, "arguments", None)
+                if name:
+                    self._pending_tool_args.setdefault(name, []).append(args or "")
 
     async def on_tool_start(
         self, context: RunContextWrapper, agent: Agent, tool: Tool
@@ -49,7 +134,15 @@ class InvestigationHooks(RunHooks):
 
         self._apply_playwright_defaults(context, tool_name)
         self._validate_playwright_click_args(context, tool_name)
-        tool_args = self._tool_args(context, tool)
+
+        # Prefer buffered args from LLM response (reliable for MCP tools)
+        buffered = self._pending_tool_args.get(tool_name)
+        if buffered:
+            tool_args = buffered.pop(0)
+            if not buffered:
+                del self._pending_tool_args[tool_name]
+        else:
+            tool_args = self._tool_args(context, tool)
 
         self.stuck_detector.record(tool_name, tool_args)
         if self.trace_recorder is not None:
@@ -58,7 +151,7 @@ class InvestigationHooks(RunHooks):
                 f"Tool Start: {tool_name}",
                 f"Args: {tool_args[:1000] or '(none)'}",
             )
-        logger.debug(f"Tool start: {tool_name}({tool_args[:100]})")
+        logger.info(f"[action] {tool_name}({_compact_jsonish(tool_args, 160)})")
 
     async def on_tool_end(
         self, context: RunContextWrapper, agent: Agent, tool: Tool, result: str
@@ -78,11 +171,11 @@ class InvestigationHooks(RunHooks):
                 f"Args: {tool_args[:1000] or '(none)'}\n\nResult:\n{result_str[:2000] or '(empty)'}",
             )
 
-        logger.debug(f"Tool end: {tool_name} -> {result_hash}")
+        logger.info(f"[result]  {tool_name} -> {_summarize_tool_result(tool_name, result_str)}")
 
         if self.stuck_detector.is_stuck():
             reason = self.stuck_detector.stuck_reason()
-            logger.warning(f"Agent stuck detected: {reason}")
+            logger.warning(f"[stuck]  {reason}")
             if self.trace_recorder is not None:
                 self.trace_recorder.record(
                     "mode_switch",
@@ -132,6 +225,16 @@ class InvestigationHooks(RunHooks):
         args = self._parse_tool_args(context)
         if args is None:
             return
+
+        # Validate that `ref` is a real snapshot ref (e.g. "e144"), not a CSS selector.
+        # @playwright/mcp browser_click requires an exact ref from the current page snapshot.
+        ref = args.get("ref")
+        if isinstance(ref, str) and not re.match(r"^e\d+$", ref.strip()):
+            raise UserError(
+                f"browser_click 'ref' must be a snapshot ref like 'e144', not a selector string. "
+                f"Got: {ref!r}. Call browser_snapshot first to get the current page refs, "
+                f"then pass the exact ref value (e.g. {{\"ref\": \"e144\"}})."
+            )
 
         candidates = [
             args.get("selector"),

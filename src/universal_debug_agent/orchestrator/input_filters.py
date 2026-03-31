@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from agents.extensions.tool_output_trimmer import ToolOutputTrimmer
@@ -44,11 +45,13 @@ _INTERACTIVE_ROLES = frozenset({
 _KEEP_MARKERS = ("[active]", "[checked]", "[cursor=pointer]", "/url:", "text:")
 
 
-def _extract_interactive_snapshot(text: str) -> str:
+def _extract_interactive_snapshot(text: str, max_lines: int | None = 200) -> str:
     """Return the Page section + an interactive-elements-only ARIA tree.
 
     Returns an empty string when no ``### Snapshot`` block is found so the
     caller can fall back to plain character-count truncation.
+
+    ``max_lines=None`` keeps all filtered lines (used for the current turn).
     """
     # 1. Keep the ### Page section verbatim (URL / title / console counts).
     page_lines: list[str] = []
@@ -96,11 +99,12 @@ def _extract_interactive_snapshot(text: str) -> str:
     if not kept:
         return ""
 
+    displayed = kept if max_lines is None else kept[:max_lines]
     parts = [
         *page_lines,
-        f"### Snapshot (interactive only — {len(yaml_lines)} → {len(kept)} lines)",
+        f"### Snapshot (interactive only — {len(yaml_lines)} → {len(displayed)} lines)",
         "```yaml",
-        *kept[:200],
+        *displayed,
         "```",
     ]
     return "\n".join(parts)
@@ -127,6 +131,7 @@ class MCPToolOutputFilter:
         })
     )
     snapshot_filter: bool = True  # set False to revert to char-truncation only
+    snapshot_dir: Path | None = None  # playwright output dir for resolving file refs
 
     def __post_init__(self) -> None:
         self._base_trimmer = ToolOutputTrimmer(
@@ -134,6 +139,22 @@ class MCPToolOutputFilter:
             max_output_chars=self.default_max_chars,
             preview_chars=self.default_preview_chars,
         )
+
+    @staticmethod
+    def _strip_images(item: dict[str, Any]) -> dict[str, Any]:
+        """Remove input_image content blocks from a function_call_output item."""
+        output = item.get("output")
+        if not isinstance(output, list):
+            return item
+        filtered = [
+            block for block in output
+            if not (isinstance(block, dict) and block.get("type") == "input_image")
+        ]
+        if len(filtered) == len(output):
+            return item
+        trimmed_item = dict(item)
+        trimmed_item["output"] = filtered
+        return trimmed_item
 
     def __call__(self, data: CallModelData[Any]) -> ModelInputData:
         trimmed = self._base_trimmer(data)
@@ -143,6 +164,7 @@ class MCPToolOutputFilter:
 
         for idx, item in enumerate(trimmed.input):
             if isinstance(item, dict) and item.get("type") == "function_call_output":
+                item = self._strip_images(item)
                 call_id = str(item.get("call_id") or item.get("id") or "")
                 tool_names = call_id_to_names.get(call_id, ())
                 if idx < boundary:
@@ -176,6 +198,35 @@ class MCPToolOutputFilter:
                 mapping[call_id] = (name, name.lower())
         return mapping
 
+    def _resolve_snapshot_refs(self, output_str: str) -> str:
+        """Replace [Snapshot](name) file references with inline ARIA tree content.
+
+        playwright MCP saves snapshot files to its cwd and returns a markdown
+        link instead of inline content. This method reads those files and injects
+        the ARIA tree so _extract_interactive_snapshot can process it normally.
+        """
+        if self.snapshot_dir is None:
+            return output_str
+
+        def _replace(m: re.Match) -> str:
+            name = m.group(1)
+            # Resolve the file path — auto-generated snapshots live in .playwright-mcp/
+            # subdirectory, named snapshots are in the root of snapshot_dir.
+            # Both are inlined; _extract_interactive_snapshot filters them down to
+            # interactive elements only (~2-5K), so raw size (20-55K) is not a problem.
+            candidates = [name, f"{name}.md"] if "/" not in name else [name]
+            for candidate in candidates:
+                path = self.snapshot_dir / candidate
+                try:
+                    content = path.read_text(encoding="utf-8")
+                    return f"### Snapshot\n```yaml\n{content}\n```"
+                except OSError:
+                    continue
+            return m.group(0)  # leave unchanged if file not found
+
+        # Match optional leading "- " list marker emitted by playwright MCP
+        return re.sub(r"-?\s*\[Snapshot\]\(([^)]+)\)", _replace, output_str)
+
     def _filter_recent_item(self, item: dict[str, Any], tool_names: tuple[str, ...]) -> dict[str, Any]:
         """Apply snapshot filter to the current (recent) turn — no char truncation."""
         if not self.snapshot_filter:
@@ -186,15 +237,48 @@ class MCPToolOutputFilter:
         lowered = " ".join(tool_names).lower()
         if not any(m in lowered for m in ("browser_", "playwright", "navigate", "snapshot")):
             return item
-        filtered = _extract_interactive_snapshot(output_str)
+        output_str = self._resolve_snapshot_refs(output_str)
+        filtered = _extract_interactive_snapshot(output_str, max_lines=None)
         if not filtered:
             return item
         trimmed_item = dict(item)
         trimmed_item["output"] = filtered
         return trimmed_item
 
+    @staticmethod
+    def _strip_old_snapshot(output_str: str) -> str:
+        """Replace snapshot ARIA tree in old turns with just the Page section.
+
+        The model only needs to know *what action was taken* from old turns,
+        not what the page looked like. Keeping the full ARIA tree wastes tokens
+        without adding useful context.
+        """
+        page_lines: list[str] = []
+        in_page = False
+        for line in output_str.splitlines():
+            if line.startswith("### Page"):
+                in_page = True
+            elif line.startswith("###") and in_page:
+                in_page = False
+            if in_page:
+                page_lines.append(line)
+
+        if not page_lines:
+            return output_str
+
+        # Remove the Snapshot block entirely, keep everything else.
+        stripped = re.sub(
+            r"### Snapshot\n```yaml\n.*?```",
+            "[snapshot omitted]",
+            output_str,
+            flags=re.DOTALL,
+        )
+        # Also remove file-ref snapshots: - [Snapshot](filename)
+        stripped = re.sub(r"-?\s*\[Snapshot\]\([^)]+\)", "[snapshot omitted]", stripped)
+        return stripped
+
     def _trim_output_item(self, item: dict[str, Any], tool_names: tuple[str, ...]) -> dict[str, Any]:
-        """Trim old-turn outputs: snapshot filter first, char-truncation fallback."""
+        """Trim old-turn outputs: drop snapshot ARIA tree, char-truncation fallback."""
         output_str = _serialize_output(item.get("output", ""))
         if not output_str:
             return item
@@ -202,12 +286,12 @@ class MCPToolOutputFilter:
         lowered_names = " ".join(tool_names).lower()
         is_browser = any(m in lowered_names for m in ("browser_", "playwright", "navigate", "snapshot"))
 
-        # Snapshot filter preserves semantic content without arbitrary char truncation.
+        # For old browser turns, drop the ARIA tree entirely — only Page metadata kept.
         if self.snapshot_filter and is_browser:
-            filtered = _extract_interactive_snapshot(output_str)
-            if filtered:
+            stripped = self._strip_old_snapshot(output_str)
+            if stripped != output_str:
                 trimmed_item = dict(item)
-                trimmed_item["output"] = filtered
+                trimmed_item["output"] = stripped
                 return trimmed_item
 
         # Fallback: original char-count truncation for non-snapshot outputs.

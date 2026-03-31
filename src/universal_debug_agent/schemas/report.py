@@ -69,6 +69,14 @@ class ScenarioReport(BaseModel):
     )
     overall_status: StepStatus = StepStatus.PASS  # pass only if ALL steps + verifications pass
     steps_executed: list[ScenarioStep] = Field(default_factory=list)
+    extracted_data: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Key business values visible on the UI at completion: order IDs, amounts, "
+            "statuses, user IDs, etc. Extracted from the final confirmation/success page. "
+            "Used as input for DB verification. E.g. {'order_id': '1234', 'total': '268.45'}"
+        ),
+    )
     data_verifications: list[DataVerification] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     issues_found: list[str] = Field(default_factory=list)  # any problems encountered — first item is the key blocker (≤80 chars)

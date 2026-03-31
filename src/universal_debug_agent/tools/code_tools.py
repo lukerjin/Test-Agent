@@ -7,6 +7,7 @@ the project's code.root_dir.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 from collections import defaultdict
 from pathlib import Path
@@ -121,6 +122,25 @@ def _format_grep_discovery(
     return output
 
 
+def _resolve_search_command() -> list[str]:
+    rg_path = shutil.which("rg")
+    if rg_path:
+        return [
+            rg_path,
+            "--line-number",
+            "--with-filename",
+        ]
+
+    grep_path = shutil.which("grep")
+    if grep_path:
+        return [
+            grep_path,
+            "-rnE",
+        ]
+
+    raise FileNotFoundError("Neither 'rg' nor 'grep' is available in PATH")
+
+
 @function_tool
 def grep_code(pattern: str, directory: str = "", file_glob: str = "*") -> str:
     """Search for a pattern in code files using ripgrep and return compact discovery results.
@@ -135,21 +155,32 @@ def grep_code(pattern: str, directory: str = "", file_glob: str = "*") -> str:
         return f"Error: not a directory: {directory}"
 
     try:
-        result = subprocess.run(
-            [
-                "rg",
-                "--line-number",
-                "--with-filename",
+        command = _resolve_search_command()
+        if command[0].endswith("rg"):
+            search_cmd = [
+                *command,
                 "--glob",
                 file_glob,
                 "--regexp",
                 pattern,
                 str(search_dir),
-            ],
+            ]
+        else:
+            search_cmd = [
+                *command,
+                "--include",
+                file_glob,
+                pattern,
+                str(search_dir),
+            ]
+        result = subprocess.run(
+            search_cmd,
             capture_output=True,
             text=True,
             timeout=10,
         )
+    except FileNotFoundError as exc:
+        return f"Error: code search tool unavailable — {exc}"
     except subprocess.TimeoutExpired:
         return "Error: code search timed out after 10s"
 

@@ -38,6 +38,7 @@ class CodeConfig(BaseModel):
 
 class MCPServerConfig(BaseModel):
     enabled: bool = True
+    role: str | None = None  # "database" | "browser" | None — used to route servers to sub-agents
     command: str
     args: list[str] = Field(default_factory=list)
     env: dict[str, str] = Field(default_factory=dict)
@@ -87,3 +88,4 @@ class ProjectProfile(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     boundaries: BoundariesConfig = Field(default_factory=BoundariesConfig)
+    scenarios: dict[str, str] = Field(default_factory=dict)  # name -> description

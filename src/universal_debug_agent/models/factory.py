@@ -105,7 +105,8 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
     provider = config.provider
     model_name = config.model_name or _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o")
 
-    # Native OpenAI — just return the model name string
+    # Native OpenAI — return model name string; SDK client uses default max_retries=2
+    # which already handles transient 429s internally without restarting the run.
     if provider == "openai" and not config.base_url:
         return model_name
 
@@ -130,11 +131,13 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
             api_key=api_key,
             base_url=base_url,
             http_client=http_client,
+            max_retries=5,
         )
     else:
         client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
+            max_retries=5,
         )
 
     return OpenAIChatCompletionsModel(
