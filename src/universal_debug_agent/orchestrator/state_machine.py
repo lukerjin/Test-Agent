@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -13,7 +14,11 @@ from agents import RunConfig, Runner
 from agents.exceptions import MaxTurnsExceeded
 from agents.mcp import MCPServerStdio
 
+from pathlib import Path
+
 from universal_debug_agent.agents.brain import create_brain_agent
+from universal_debug_agent.tools import db_tool
+from universal_debug_agent.memory.lesson import generate_lesson
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
 from universal_debug_agent.orchestrator.input_filters import MCPToolOutputFilter
 from universal_debug_agent.observability.llm_usage import LLMUsageTracker
@@ -26,11 +31,6 @@ from universal_debug_agent.schemas.report import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-_RUN_CONFIG = RunConfig(
-    call_model_input_filter=MCPToolOutputFilter(),
-)
 
 
 class InvestigationState(Enum):
@@ -157,12 +157,43 @@ class InvestigationOrchestrator:
         self.trace_recorder = trace_recorder
         self.last_raw_output_path: str = ""
         self.last_error_output_path: str = ""
+        self.last_lesson: str = ""
+        self.last_lesson_tags: list[str] = []
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(
             max_steps=profile.boundaries.max_steps,
             stuck_budget_ratio=profile.boundaries.stuck_budget_ratio,
         )
         self.evidence_collector = EvidenceCollector()
+        self._run_config = RunConfig(
+            call_model_input_filter=MCPToolOutputFilter(
+                snapshot_dir=self._find_playwright_cwd(mcp_servers),
+            )
+        )
+
+        # Identify DB MCP servers: prefer explicit role="database", fall back to name-based detection
+        db_server_names = {
+            name for name, cfg in profile.mcp_servers.items()
+            if cfg.role == "database" or (cfg.role is None and "database" in name.lower())
+        }
+        db_servers = [s for s in mcp_servers if s.name in db_server_names]
+        db_tool.configure(
+            db_mcp_servers=db_servers,
+            model=model,
+            max_turns=profile.boundaries.max_turns,
+            trace_recorder=trace_recorder,
+        )
+
+    @staticmethod
+    def _find_playwright_cwd(mcp_servers: list[MCPServerStdio]) -> Path | None:
+        """Return the working directory of the playwright MCP server, if any."""
+        for server in mcp_servers:
+            if server.name == "playwright":
+                cwd = getattr(server.params, "cwd", None)
+                if cwd:
+                    return Path(cwd)
+        return None
+
 
     async def run(self, scenario: str) -> ScenarioReport:
         """Run the full test execution pipeline."""
@@ -177,7 +208,10 @@ class InvestigationOrchestrator:
                 raise
 
         try:
-            return await self._run_pipeline(scenario)
+            report = await self._run_pipeline(scenario)
+            # Generate lesson BEFORE cleanup so anyio scopes from MCP servers are still clean
+            self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
+            return report
         except BaseException as e:
             if self.usage_tracker is not None:
                 self.usage_tracker.record_error(e, phase=self.state.value)
@@ -198,7 +232,7 @@ class InvestigationOrchestrator:
 
         # Phase 1: ReAct mode — execute the test scenario
         self.state = InvestigationState.REACT
-        logger.info("Starting test execution...")
+        logger.info("Phase: UI execution")
 
         hooks = InvestigationHooks(
             stuck_detector=self.stuck_detector,
@@ -220,7 +254,7 @@ class InvestigationOrchestrator:
                 scenario,
                 max_turns=self.profile.boundaries.max_turns,
                 hooks=hooks,
-                run_config=_RUN_CONFIG,
+                run_config=self._run_config,
             )
             if self.usage_tracker is not None:
                 self.usage_tracker.record_run_result(result, phase="react")
@@ -251,6 +285,7 @@ class InvestigationOrchestrator:
     async def _run_analysis(self, scenario: str, evidence_summary: str) -> ScenarioReport:
         """Phase 2: Analysis mode — analyze what happened when agent got stuck."""
         self.state = InvestigationState.ANALYZING
+        logger.info("Phase: Analysis")
 
         analysis_agent = create_brain_agent(
             profile=self.profile,
@@ -279,7 +314,7 @@ class InvestigationOrchestrator:
             analysis_agent,
             analysis_input,
             max_turns=self.profile.boundaries.max_turns,
-            run_config=_RUN_CONFIG,
+            run_config=self._run_config,
         )
         if self.usage_tracker is not None:
             self.usage_tracker.record_run_result(result, phase="analysis")

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from universal_debug_agent.tools.code_tools import _format_grep_discovery
+from universal_debug_agent.tools.code_tools import _format_grep_discovery, _resolve_search_command
 
 
 def test_grep_code_returns_compact_file_summary():
@@ -38,3 +38,23 @@ def test_grep_code_caps_large_match_sets():
     assert "matched_files: 12" in output
     assert "showing top 8" in output
     assert "Narrow directory or file_glob" in output
+
+
+def test_resolve_search_command_prefers_rg(monkeypatch):
+    monkeypatch.setattr("universal_debug_agent.tools.code_tools.shutil.which", lambda name: {
+        "rg": "/custom/rg",
+        "grep": "/usr/bin/grep",
+    }.get(name))
+
+    command = _resolve_search_command()
+    assert command == ["/custom/rg", "--line-number", "--with-filename"]
+
+
+def test_resolve_search_command_falls_back_to_grep(monkeypatch):
+    monkeypatch.setattr("universal_debug_agent.tools.code_tools.shutil.which", lambda name: {
+        "rg": None,
+        "grep": "/usr/bin/grep",
+    }.get(name))
+
+    command = _resolve_search_command()
+    assert command == ["/usr/bin/grep", "-rnE"]

@@ -68,7 +68,15 @@ mcp_servers:
   playwright:
     enabled: true
     command: "npx"
-    args: ["@playwright/mcp@latest"]
+    args:
+      [
+        "@playwright/mcp@latest",
+        "--browser",
+        "chromium",
+        "--timeout-action",
+        "15000",
+        "--ignore-https-errors",
+      ]
     cwd: "./artifacts/playwright"
     cache_tools_list: true
     client_session_timeout_seconds: 15
@@ -85,6 +93,7 @@ mcp_servers:
       - browser_take_screenshot
   database:
     enabled: true
+    role: database
     command: "node"
     args: ["./path/to/your/db-mcp/index.js"]
     cache_tools_list: true
@@ -107,3 +116,6 @@ boundaries:
   stuck_budget_ratio: 0.85
   allowed_domains:
     - "staging.example.com"
+
+scenarios:
+  test: "testing workflow"

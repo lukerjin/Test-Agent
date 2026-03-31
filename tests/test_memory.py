@@ -58,7 +58,7 @@ class TestMemoryStore:
             ))
 
             ctx = store.build_prompt_context()
-            assert "Past Investigation Memory" in ctx
+            assert "Past Run Lessons" in ctx
             assert "Order status wrong" in ctx
             assert "status_map bug" in ctx
 
