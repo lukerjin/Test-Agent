@@ -66,6 +66,18 @@ class MemoryConfig(BaseModel):
     max_entries_in_prompt: int = 20  # how many past records to inject into prompt
 
 
+class FilterConfig(BaseModel):
+    """Token-budget-aware filtering parameters for MCP tool outputs."""
+
+    recent_turns: int = 1
+    default_max_chars: int = 4_000
+    default_preview_chars: int = 800
+    aggressive_max_chars: int = 1_500
+    aggressive_preview_chars: int = 300
+    evidence_preview_chars: int = 1500
+    old_turn_summary: bool = True
+
+
 class BoundariesConfig(BaseModel):
     readonly: bool = True
     forbidden_actions: list[str] = Field(
@@ -75,6 +87,7 @@ class BoundariesConfig(BaseModel):
     max_turns: int = 20
     stuck_budget_ratio: float = Field(default=0.85, ge=0.5, le=1.0)
     allowed_domains: list[str] = Field(default_factory=list)
+    filter: FilterConfig = Field(default_factory=FilterConfig)
 
 
 class ProjectProfile(BaseModel):

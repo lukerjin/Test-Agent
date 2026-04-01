@@ -83,6 +83,26 @@ class StuckDetector:
                 )
                 return True
 
+        # Rule 1b: repeated browser_snapshot calls (ignore filename — only depth matters)
+        if len(self.history) >= self.REPEAT_THRESHOLD:
+            recent = self.history[-self.REPEAT_THRESHOLD :]
+            snap_sigs = []
+            for tc in recent:
+                if tc.name != "browser_snapshot":
+                    break
+                try:
+                    parsed = json.loads(tc.args)
+                    snap_sigs.append(parsed.get("depth"))
+                except Exception:
+                    snap_sigs.append(tc.args)
+            if len(snap_sigs) == self.REPEAT_THRESHOLD and len(set(snap_sigs)) == 1:
+                self._stuck_reason = (
+                    f"Repeated browser_snapshot {self.REPEAT_THRESHOLD} times "
+                    f"at depth={snap_sigs[0]} — snapshot result is a file reference, "
+                    f"call browser_snapshot without filename to get inline ARIA content"
+                )
+                return True
+
         # Rule 2: last N results all identical
         if len(self.history) >= self.SAME_RESULT_WINDOW:
             recent = self.history[-self.SAME_RESULT_WINDOW :]
@@ -115,12 +135,13 @@ class EvidenceCollector:
     """Collects evidence from tool calls during test execution."""
 
     items: list[dict] = field(default_factory=list)
+    preview_chars: int = 1500
 
     def collect(self, tool_name: str, tool_args: str, result: str) -> None:
         self.items.append({
             "tool": tool_name,
             "args": tool_args,
-            "result_preview": result[:500] if result else "",
+            "result_preview": result[:self.preview_chars] if result else "",
         })
 
     def build_summary(self) -> str:
@@ -164,9 +185,17 @@ class InvestigationOrchestrator:
             max_steps=profile.boundaries.max_steps,
             stuck_budget_ratio=profile.boundaries.stuck_budget_ratio,
         )
-        self.evidence_collector = EvidenceCollector()
+        filter_cfg = profile.boundaries.filter
+        self.evidence_collector = EvidenceCollector(
+            preview_chars=filter_cfg.evidence_preview_chars,
+        )
         self._run_config = RunConfig(
             call_model_input_filter=MCPToolOutputFilter(
+                recent_turns=filter_cfg.recent_turns,
+                default_max_chars=filter_cfg.default_max_chars,
+                default_preview_chars=filter_cfg.default_preview_chars,
+                aggressive_max_chars=filter_cfg.aggressive_max_chars,
+                aggressive_preview_chars=filter_cfg.aggressive_preview_chars,
                 snapshot_dir=self._find_playwright_cwd(mcp_servers),
             )
         )
@@ -177,11 +206,12 @@ class InvestigationOrchestrator:
             if cfg.role == "database" or (cfg.role is None and "database" in name.lower())
         }
         db_servers = [s for s in mcp_servers if s.name in db_server_names]
+        cache_path = Path(f"memory/db_schema_{profile.project.name.replace(' ', '_')}.json")
         db_tool.configure(
             db_mcp_servers=db_servers,
             model=model,
-            max_turns=profile.boundaries.max_turns,
             trace_recorder=trace_recorder,
+            cache_path=cache_path,
         )
 
     @staticmethod

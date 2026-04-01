@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -9,6 +10,8 @@ from typing import Any
 
 from agents.extensions.tool_output_trimmer import ToolOutputTrimmer
 from agents.run_config import CallModelData, ModelInputData
+
+logger = logging.getLogger(__name__)
 
 
 def _serialize_output(value: Any) -> str:
@@ -40,7 +43,16 @@ _INTERACTIVE_ROLES = frozenset({
     "button", "link", "textbox", "checkbox", "radio",
     "combobox", "searchbox", "heading", "alert", "dialog",
     "listitem", "row", "cell",
+    "tab", "tabpanel", "menuitem", "option", "switch",
+    "img", "navigation", "status", "banner", "form",
+    "spinbutton", "slider", "progressbar",
 })
+
+# Match ARIA roles at YAML line boundaries: "- rolename " or "- rolename[" or "- rolename\n"
+# Avoids substring false positives (e.g. "row" matching "arrow").
+_ROLE_PATTERN = re.compile(
+    r"- (?:" + "|".join(re.escape(r) for r in sorted(_INTERACTIVE_ROLES)) + r")(?:\s|$|\[|\")"
+)
 
 _KEEP_MARKERS = ("[active]", "[checked]", "[cursor=pointer]", "/url:", "text:")
 
@@ -70,35 +82,47 @@ def _extract_interactive_snapshot(text: str, max_lines: int | None = 200) -> str
         return ""
 
     yaml_lines = snap_match.group(1).splitlines()
-    kept: list[str] = []
+    kept_indices: set[int] = set()
 
-    for line in yaml_lines:
+    for idx, line in enumerate(yaml_lines):
         stripped = line.strip()
-        lower = stripped.lower()
 
         # Drop [unchanged] back-references — zero information density.
         if "[unchanged]" in stripped:
             continue
 
-        # Keep any line that names an interactive ARIA role.
-        if any(role in lower for role in _INTERACTIVE_ROLES):
-            kept.append(line)
-            continue
+        should_keep = False
+
+        # Keep any line that names an interactive ARIA role (word-boundary match).
+        if _ROLE_PATTERN.search(stripped):
+            should_keep = True
 
         # Keep lines with action/state markers.
-        if any(marker in stripped for marker in _KEEP_MARKERS):
-            kept.append(line)
-            continue
+        elif any(marker in stripped for marker in _KEEP_MARKERS):
+            should_keep = True
 
         # Keep inline-text nodes: "- generic [ref=eN]: visible text"
         # These carry section labels, prices, error messages, etc.
-        if re.search(r"\[ref=e\d+\]:\s+\S", stripped):
-            kept.append(line)
-            continue
+        elif re.search(r"\[ref=e\d+\]:\s+\S", stripped):
+            should_keep = True
 
-    if not kept:
+        if should_keep:
+            kept_indices.add(idx)
+            # Walk up indentation to preserve parent context (form structure, labels).
+            indent = len(line) - len(line.lstrip())
+            for back_idx in range(idx - 1, -1, -1):
+                parent_line = yaml_lines[back_idx]
+                parent_indent = len(parent_line) - len(parent_line.lstrip())
+                if parent_indent < indent:
+                    kept_indices.add(back_idx)
+                    indent = parent_indent
+                    if parent_indent == 0:
+                        break
+
+    if not kept_indices:
         return ""
 
+    kept = [yaml_lines[i] for i in sorted(kept_indices)]
     displayed = kept if max_lines is None else kept[:max_lines]
     parts = [
         *page_lines,
@@ -178,14 +202,24 @@ class MCPToolOutputFilter:
         return ModelInputData(input=new_items, instructions=trimmed.instructions)
 
     def _find_recent_boundary(self, items: list[Any]) -> int:
-        user_msg_count = 0
+        """Return the index of the first item in the 'recent' zone.
+
+        Counts function_call_output items from the end. The last
+        ``recent_turns`` outputs are treated as recent (snapshot-filter only);
+        everything before that index is old (snapshot stripped + char-truncated).
+
+        Using role=="user" is wrong for the Responses API: the initial user
+        message sits at index 0, making every subsequent item "recent" and
+        preventing any stripping of old snapshots.
+        """
+        output_count = 0
         for i in range(len(items) - 1, -1, -1):
             item = items[i]
-            if isinstance(item, dict) and item.get("role") == "user":
-                user_msg_count += 1
-                if user_msg_count >= self.recent_turns:
+            if isinstance(item, dict) and item.get("type") == "function_call_output":
+                output_count += 1
+                if output_count >= self.recent_turns:
                     return i
-        return len(items)
+        return 0  # fewer outputs than recent_turns → all recent
 
     def _build_call_id_to_names(self, items: list[Any]) -> dict[str, tuple[str, ...]]:
         mapping: dict[str, tuple[str, ...]] = {}
@@ -210,18 +244,36 @@ class MCPToolOutputFilter:
 
         def _replace(m: re.Match) -> str:
             name = m.group(1)
-            # Resolve the file path — auto-generated snapshots live in .playwright-mcp/
-            # subdirectory, named snapshots are in the root of snapshot_dir.
-            # Both are inlined; _extract_interactive_snapshot filters them down to
-            # interactive elements only (~2-5K), so raw size (20-55K) is not a problem.
-            candidates = [name, f"{name}.md"] if "/" not in name else [name]
-            for candidate in candidates:
-                path = self.snapshot_dir / candidate
-                try:
-                    content = path.read_text(encoding="utf-8")
-                    return f"### Snapshot\n```yaml\n{content}\n```"
-                except OSError:
-                    continue
+            # Build candidate paths. Auto-generated snapshots live in .playwright-mcp/
+            # subdirectory; named snapshots are in the root of snapshot_dir.
+            if "/" in name:
+                basename = Path(name).name
+                candidates = [
+                    name,                                  # exact relative path
+                    basename,                              # basename only
+                    f".playwright-mcp/{basename}",         # explicit subdir
+                ]
+            else:
+                candidates = [name, f"{name}.md"]
+
+            # Try each candidate in snapshot_dir and its parent (handles cwd off-by-one)
+            search_dirs = [self.snapshot_dir]
+            if self.snapshot_dir.parent != self.snapshot_dir:
+                search_dirs.append(self.snapshot_dir.parent)
+
+            for base_dir in search_dirs:
+                for candidate in candidates:
+                    path = base_dir / candidate
+                    try:
+                        content = path.read_text(encoding="utf-8")
+                        return f"### Snapshot\n```yaml\n{content}\n```"
+                    except OSError:
+                        continue
+
+            logger.warning(
+                "Failed to resolve snapshot ref %r — tried %s and parent",
+                name, self.snapshot_dir,
+            )
             return m.group(0)  # leave unchanged if file not found
 
         # Match optional leading "- " list marker emitted by playwright MCP
@@ -246,12 +298,37 @@ class MCPToolOutputFilter:
         return trimmed_item
 
     @staticmethod
-    def _strip_old_snapshot(output_str: str) -> str:
-        """Replace snapshot ARIA tree in old turns with just the Page section.
+    def _make_page_summary(output_str: str) -> str:
+        """Extract a ~30-token mini summary from a resolved snapshot for old turns."""
+        url_match = re.search(r"Page URL:\s*(\S+)", output_str)
+        url = url_match.group(1).strip() if url_match else "unknown"
+
+        snap_match = re.search(r"### Snapshot\n```yaml\n(.*?)```", output_str, re.DOTALL)
+        if not snap_match:
+            return f"[page: {url}]"
+
+        yaml_text = snap_match.group(1)
+        headings = re.findall(r'- heading\s+"([^"]*)"', yaml_text)
+        buttons = re.findall(r'- button\s+"([^"]*)"', yaml_text)
+
+        parts = [f"page: {url}"]
+        if headings:
+            parts.append(f"headings: {', '.join(headings[:2])}")
+        if buttons:
+            parts.append(f"buttons: {', '.join(buttons[:3])}")
+
+        summary = " | ".join(parts)
+        if len(summary) > 120:
+            summary = summary[:117] + "..."
+        return f"[{summary}]"
+
+    @classmethod
+    def _strip_old_snapshot(cls, output_str: str) -> str:
+        """Replace snapshot ARIA tree in old turns with a mini summary.
 
         The model only needs to know *what action was taken* from old turns,
-        not what the page looked like. Keeping the full ARIA tree wastes tokens
-        without adding useful context.
+        not what the page looked like. The mini summary preserves key page
+        indicators (URL, headings, buttons) for long-flow recall.
         """
         page_lines: list[str] = []
         in_page = False
@@ -266,15 +343,17 @@ class MCPToolOutputFilter:
         if not page_lines:
             return output_str
 
-        # Remove the Snapshot block entirely, keep everything else.
+        summary = cls._make_page_summary(output_str)
+
+        # Remove the Snapshot block, replace with mini summary.
         stripped = re.sub(
             r"### Snapshot\n```yaml\n.*?```",
-            "[snapshot omitted]",
+            summary,
             output_str,
             flags=re.DOTALL,
         )
         # Also remove file-ref snapshots: - [Snapshot](filename)
-        stripped = re.sub(r"-?\s*\[Snapshot\]\([^)]+\)", "[snapshot omitted]", stripped)
+        stripped = re.sub(r"-?\s*\[Snapshot\]\([^)]+\)", summary, stripped)
         return stripped
 
     def _trim_output_item(self, item: dict[str, Any], tool_names: tuple[str, ...]) -> dict[str, Any]:
@@ -286,8 +365,9 @@ class MCPToolOutputFilter:
         lowered_names = " ".join(tool_names).lower()
         is_browser = any(m in lowered_names for m in ("browser_", "playwright", "navigate", "snapshot"))
 
-        # For old browser turns, drop the ARIA tree entirely — only Page metadata kept.
+        # For old browser turns, resolve file refs then replace ARIA tree with mini summary.
         if self.snapshot_filter and is_browser:
+            output_str = self._resolve_snapshot_refs(output_str)
             stripped = self._strip_old_snapshot(output_str)
             if stripped != output_str:
                 trimmed_item = dict(item)
