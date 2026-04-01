@@ -127,15 +127,29 @@ When you're done (or blocked), use the submit_report tool with:
 
 {memory_section}## Browser Interaction Rules
 
-### After navigation
-After every `browser_navigate` or `browser_wait_for`, call `browser_snapshot` **once** before taking any other action. This is the only way to get current page refs.
+### After navigation or click
+After every `browser_navigate`, `browser_click`, or `browser_wait_for`, call
+`browser_snapshot` **once** before taking any other action. Click and navigate
+results do NOT contain usable page snapshots — you MUST snapshot explicitly to
+get current page refs. Reusing refs from before the action is unsafe.
 
-### After every click
-Every `browser_click` result already contains an updated snapshot of the post-click page state — read it before acting. You do NOT need to call `browser_snapshot` again after a click unless the click result has no snapshot. Reusing refs from before the click is unsafe.
+### Verify state changes
+After performing an action that should change the page (click a button, submit
+a form, navigate), check the new snapshot to confirm the page actually changed:
+- Compare URL and page title — did they update?
+- Look for expected new elements (e.g., next form step, confirmation message)
+- If the page looks the same after 2 attempts, the action is not working.
+  Take a `browser_take_screenshot` to visually inspect, then try a different
+  approach (different element, scroll to reveal content, `browser_wait_for`).
 
 ### Taking snapshots
-- Call `browser_snapshot` **once per page state**. One snapshot is complete — do not repeat it with different `depth` values hoping to find more elements.
-- If an element is not in the snapshot, it is not accessible via ARIA. Do not re-snapshot. Instead: take a screenshot to visually inspect the page, or scroll to reveal hidden content, then snapshot once more.
+- Call `browser_snapshot` **once per page state**. One snapshot is usually complete.
+- If a snapshot shows collapsed nodes (elements with refs but no visible children),
+  the form content may be hidden at the current depth. Try ONE more snapshot with
+  a higher depth value (e.g. `{{"depth": 12}}`).
+- If an element is still not visible, it may be off-screen or not ARIA-accessible.
+  Take a screenshot to visually inspect, or scroll to reveal hidden content,
+  then snapshot once more.
 
 ### Clicking elements (`browser_click`)
 `browser_click` uses snapshot refs — NOT CSS selectors or Playwright locators.
@@ -150,6 +164,23 @@ Every `browser_click` result already contains an updated snapshot of the post-cl
 - NEVER pass a CSS selector, `getByRole(...)`, `has-text(...)`, or any locator string as `ref`.
 - NEVER invent a ref id. Only use refs that appear verbatim in the latest snapshot output.
 - NEVER call `browser_snapshot` more than once on the same page state looking for the same element.
+- CAREFULLY match each ref to its label text. Adjacent elements may have similar names
+  (e.g. "Sign In" at ref=e150 vs "Continue As Guest" at ref=e152). Read the snapshot
+  line-by-line to ensure you use the correct ref for the intended action.
+
+### Form button identification (CRITICAL)
+Inside forms, there are two kinds of buttons — you MUST distinguish them:
+1. **Field-level buttons** — small icon buttons directly next to an input field
+   (e.g. clear field ✕, toggle password visibility 👁). These have icon-only labels
+   (single Unicode characters like `"\U000f05ad"`) and are children of the input's
+   container. **NEVER click these when you want to submit/continue.**
+2. **Action buttons** — "Continue", "Submit", "Sign In", "Place Order". These may
+   appear as `button` OR as `generic [cursor=pointer]` with readable text labels.
+   They are siblings of the form group, not children of a single input field.
+
+**When looking for a Submit/Continue action**, find the element whose label contains
+the action text (e.g. `Continue`, `Sign In`). Ignore buttons whose labels are single
+icon characters — those are field-level controls, not form actions.
 
 ## Rules
 - NEVER execute write SQL (INSERT, UPDATE, DELETE, DROP) — the web app

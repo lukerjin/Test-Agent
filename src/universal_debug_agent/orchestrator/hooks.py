@@ -210,14 +210,31 @@ class InvestigationHooks(RunHooks):
             context.tool_call.arguments = payload
 
     def _apply_playwright_defaults(self, context: RunContextWrapper, tool_name: str) -> None:
-        if tool_name != "browser_take_screenshot":
-            return
-        args = self._parse_tool_args(context)
-        if args is None:
-            return
-        if not args.get("type"):
-            args["type"] = "png"
-            self._write_tool_args(context, args)
+        if tool_name == "browser_take_screenshot":
+            args = self._parse_tool_args(context)
+            if args is not None and not args.get("type"):
+                args["type"] = "png"
+                self._write_tool_args(context, args)
+
+        elif tool_name == "browser_snapshot":
+            # Strip `filename` so Playwright MCP returns inline ARIA content instead
+            # of a file reference. Without inline content the LLM cannot see element
+            # refs and gets stuck calling snapshot in a loop.
+            # Enforce minimum depth=10: checkout forms nest textboxes and buttons at
+            # depth 9-10 in the ARIA tree. depth<10 shows the form container and
+            # labels but collapses the actual input fields, causing the model to
+            # click buttons without filling required fields.
+            args = self._parse_tool_args(context)
+            if args is not None:
+                changed = False
+                if "filename" in args:
+                    args.pop("filename")
+                    changed = True
+                if (args.get("depth") or 0) < 10:
+                    args["depth"] = 10
+                    changed = True
+                if changed:
+                    self._write_tool_args(context, args)
 
     def _validate_playwright_click_args(self, context: RunContextWrapper, tool_name: str) -> None:
         if tool_name != "browser_click":

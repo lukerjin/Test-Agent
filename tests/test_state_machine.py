@@ -95,6 +95,12 @@ class TestEvidenceCollector:
 
     def test_long_result_truncated(self):
         ec = EvidenceCollector()
+        long_result = "x" * 2000
+        ec.collect("tool", "args", long_result)
+        assert len(ec.items[0]["result_preview"]) == 1500  # default preview_chars
+
+    def test_custom_preview_chars(self):
+        ec = EvidenceCollector(preview_chars=300)
         long_result = "x" * 1000
         ec.collect("tool", "args", long_result)
-        assert len(ec.items[0]["result_preview"]) == 500
+        assert len(ec.items[0]["result_preview"]) == 300

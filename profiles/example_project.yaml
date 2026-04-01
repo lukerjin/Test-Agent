@@ -49,7 +49,7 @@ model:
 
 # --- Memory ---
 memory:
-  enabled: true
+  enabled: false
   path: "./memory/{project_name}.jsonl" # auto-creates, per-project file
   max_entries_in_prompt: 2 # inject last N records into prompt
 
@@ -102,7 +102,6 @@ mcp_servers:
       DB_PORT_ENV: "DB_PORT"
       DB_USER_ENV: "DB_USER"
       DB_PASSWORD_ENV: "DB_PASSWORD"
-      DB_ALIASES_ENV: "DB_ALIASES"
 
 boundaries:
   readonly: true

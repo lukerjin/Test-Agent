@@ -4,47 +4,154 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 from agents import Agent, RunContextWrapper, RunHooks, Runner, RunConfig, Tool, function_tool
 from agents.mcp import MCPServerStdio
 
+from universal_debug_agent.agents.db_agent import DB_MAX_TURNS, DBVerificationOutput
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
 
 logger = logging.getLogger(__name__)
 
+
+def _serialize_tool_result(result: Any) -> str:
+    """Extract text from an MCP tool result.
+
+    MCP results may be structured content like [{"type": "text", "text": "..."}]
+    or a plain string. Using str() on the structured form produces Python repr
+    with single quotes, breaking JSON parsing downstream.
+    """
+    if not result:
+        return ""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        parts = []
+        for item in result:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(item["text"])
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if isinstance(result, dict) and "text" in result:
+        return result["text"]
+    return str(result)
+
+
 # Module-level state — configured by state_machine before the run starts
 _db_mcp_servers: list[MCPServerStdio] = []
 _model: Any = None
-_max_turns: int = 15
 _trace_recorder: ExecutionTraceRecorder | None = None
+_cache_path: Path | None = None
 
 
 def configure(
     db_mcp_servers: list[MCPServerStdio],
     model: Any,
-    max_turns: int = 15,
     trace_recorder: ExecutionTraceRecorder | None = None,
+    cache_path: Path | None = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _max_turns, _trace_recorder
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path
     _db_mcp_servers = db_mcp_servers
     _model = model
-    _max_turns = max_turns
     _trace_recorder = trace_recorder
+    _cache_path = cache_path
+
+
+def _load_schema_cache() -> dict:
+    if _cache_path is None or not _cache_path.exists():
+        return {}
+    try:
+        return json.loads(_cache_path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_schema_cache(cache: dict) -> None:
+    if _cache_path is None:
+        return
+    try:
+        _cache_path.parent.mkdir(parents=True, exist_ok=True)
+        _cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
+    except Exception as e:
+        logger.warning(f"[db] failed to save schema cache: {e}")
+
+
+def _format_cache_for_prompt(cache: dict) -> str:
+    """Format cached schema as a prompt section."""
+    if not cache:
+        return ""
+    lines = ["## Cached DB Schema (skip describe_table for these tables)"]
+    for db_table, columns in cache.items():
+        lines.append(f"\n### {db_table}")
+        lines.append(columns)
+    return "\n".join(lines)
+
+
+def _parse_describe_result(result_str: str) -> str:
+    """Parse describe_table result into a clean column summary string.
+
+    The MCP tool returns a JSON-encoded list of dicts like:
+      [{"Field": "id", "Type": "int(11)", "Key": "PRI", "Extra": "auto_increment"}, ...]
+
+    This may be wrapped in a {'type': 'text', 'text': '...'} envelope.
+    Returns a single line: "id int(11) PRI auto_increment, order_id int(11), ..."
+    """
+    text = result_str.strip()
+
+    # Unwrap {'type': 'text', 'text': '...'} envelope if present
+    if text.startswith("{") and '"type"' in text and '"text"' in text:
+        try:
+            envelope = json.loads(text)
+            if isinstance(envelope, dict) and "text" in envelope:
+                text = envelope["text"]
+        except Exception:
+            pass
+
+    # Parse the column array
+    try:
+        columns = json.loads(text)
+    except Exception:
+        # Return truncated raw string as fallback
+        return result_str[:500]
+
+    if not isinstance(columns, list):
+        return result_str[:500]
+
+    parts: list[str] = []
+    for col in columns:
+        if not isinstance(col, dict):
+            continue
+        field = col.get("Field", "")
+        col_type = col.get("Type", "")
+        key = col.get("Key", "")
+        extra = col.get("Extra", "")
+        tokens = [f"{field} {col_type}"]
+        if key:
+            tokens.append(key)
+        if extra:
+            tokens.append(extra)
+        parts.append(" ".join(t for t in tokens if t))
+
+    return ", ".join(parts) if parts else result_str[:500]
 
 
 class _DBHooks(RunHooks):
-    """Lightweight hooks for the DB agent — logs to terminal and trace."""
+    """Lightweight hooks for the DB agent — logs to terminal, writes trace, and updates schema cache."""
 
     def __init__(self, trace_recorder: ExecutionTraceRecorder | None):
         self.trace_recorder = trace_recorder
+        self._pending_args: dict[str, str] = {}
 
     async def on_tool_start(
         self, context: RunContextWrapper, agent: Agent, tool: Tool
     ) -> None:
         tool_name = getattr(tool, "name", str(tool))
         tool_args = getattr(context, "tool_arguments", "") or ""
+        self._pending_args[tool_name] = tool_args
         logger.info(f"[db][action] {tool_name}({tool_args[:160]})")
         if self.trace_recorder is not None:
             self.trace_recorder.record(
@@ -57,7 +164,9 @@ class _DBHooks(RunHooks):
         self, context: RunContextWrapper, agent: Agent, tool: Tool, result: str
     ) -> None:
         tool_name = getattr(tool, "name", str(tool))
-        result_str = str(result) if result else ""
+        # MCP tool results may be structured content ([{"type": "text", "text": "..."}]).
+        # Extract the text properly instead of using str() which produces Python repr.
+        result_str = _serialize_tool_result(result)
         preview = result_str[:200].replace("\n", " ")
         logger.info(f"[db][result] {tool_name} -> {preview}")
         if self.trace_recorder is not None:
@@ -66,6 +175,21 @@ class _DBHooks(RunHooks):
                 f"[DB] Tool End: {tool_name}",
                 f"Result:\n{result_str[:2000] or '(empty)'}",
             )
+
+        # Cache describe_table results
+        if tool_name == "describe_table" and result_str and "Error" not in result_str:
+            args_str = self._pending_args.get(tool_name, "")
+            try:
+                args = json.loads(args_str) if args_str else {}
+                db = args.get("database", "")
+                table = args.get("table", "")
+                if db and table:
+                    cache = _load_schema_cache()
+                    cache[f"{db}.{table}"] = _parse_describe_result(result_str)
+                    _save_schema_cache(cache)
+                    logger.info(f"[db] cached schema for {db}.{table}")
+            except Exception as e:
+                logger.debug(f"[db] could not cache schema: {e}")
 
 
 @function_tool
@@ -96,18 +220,27 @@ async def verify_in_db(data_json: str) -> str:
             "severity": "high",
         }])
 
-    db_agent = create_db_agent(mcp_servers=_db_mcp_servers, model=_model)
+    schema_cache = _format_cache_for_prompt(_load_schema_cache())
+    db_agent = create_db_agent(
+        mcp_servers=_db_mcp_servers,
+        model=_model,
+        schema_cache=schema_cache,
+    )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
+    if schema_cache:
+        logger.info(f"[db] injecting cached schema ({len(schema_cache)} chars)")
 
     try:
         result = await Runner.run(
             db_agent,
             data_json,
-            max_turns=_max_turns,
+            max_turns=DB_MAX_TURNS,
             hooks=_DBHooks(_trace_recorder),
             run_config=RunConfig(),
         )
         output = result.final_output
+        if isinstance(output, DBVerificationOutput):
+            return json.dumps([v.model_dump() for v in output.verifications], default=str)
         if isinstance(output, str):
             return output
         return json.dumps(output)

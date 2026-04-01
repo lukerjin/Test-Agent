@@ -18,21 +18,23 @@
 ## 架构
 
 ```
-┌─────────────────────────────────────────────────────┐
-│               Test Agent (单 Agent)                  │
-│         ReAct 模式 ↔ Analysis 模式（自动切换）          │
-│        (Orchestrator + StuckDetector 控制切换)         │
-├──────────┬──────────┬──────────┬────────────────────┤
-│Playwright│ DB MCP   │  Code    │    Memory (RAG)    │
-│  MCP     │ (MySQL)  │  Tools   │   JSONL + tags     │
-│ 操作页面  │ 只读验证  │ 读代码   │ 自动提炼 lesson     │
-│ 截图/快照 │ 查数据    │ 搜索    │ 相似场景检索注入    │
-├──────────┴──────────┴──────────┴────────────────────┤
-│   LLM Provider (OpenAI / Gemini / DeepSeek / ...)   │
-├─────────────────────────────────────────────────────┤
-│               Project Profile (YAML)                 │
-│      每个项目独立配置环境、认证、LLM、边界、工具         │
-└─────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────┐
+│                  UI Agent (ReAct / Analysis)                │
+│           Orchestrator + StuckDetector 控制模式切换          │
+├──────────┬──────────┬──────────┬──────────────────────────┤
+│Playwright│  Code    │Memory    │  verify_in_db (tool)     │
+│  MCP     │  Tools   │  RAG     │  ┌────────────────────┐  │
+│ 操作页面  │ 读代码   │JSONL+tag │  │   DB Sub-Agent     │  │
+│ 截图/快照 │ 搜索     │lesson注入│  │  独立 Runner.run() │  │
+│          │          │          │  │  DB MCP (只读)     │  │
+│          │          │          │  │  Schema Cache(本地)│  │
+│          │          │          │  └────────────────────┘  │
+├──────────┴──────────┴──────────┴──────────────────────────┤
+│        LLM Provider (OpenAI / Gemini / DeepSeek / ...)     │
+├────────────────────────────────────────────────────────────┤
+│                  Project Profile (YAML)                     │
+│         每个项目独立配置环境、认证、LLM、边界、工具            │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -146,8 +148,13 @@ test-agent test -p profiles/my_project.yaml
         │
         ▼
 3. 数据验证（流程完成后触发）
-   ├── 1-3 条高价值 DB 查询
-   └── 验证关键业务数据落库正确
+   ├── UI agent 从成功页提取业务数据（order_id / total / email 等）存入 extracted_data
+   ├── 调用 verify_in_db(extracted_data) 工具
+   │   └── 启动独立 DB Sub-Agent（新 Runner.run，context 从零开始）
+   │       ├── 注入本地 Schema Cache（已知表结构，跳过 describe_table）
+   │       ├── 一次性批量执行 2-3 条 SELECT 验证
+   │       └── 返回 DataVerification JSON 数组给 UI agent
+   └── UI agent 将结果写入报告的 data_verifications
         │
         ▼
 4. 卡住检测（StuckDetector，全程监控）
@@ -198,6 +205,20 @@ Playwright 产品页的完整 ARIA tree 可达 900+ 行 / ~55K chars。`MCPToolO
 | **历史轮（old turns）** | 丢弃 snapshot ARIA tree，只保留 `### Page`（URL + title），标注 `[snapshot omitted]` |
 
 历史轮模型只需知道"之前在哪个页面做了什么操作"，不需要看当时页面的全部元素。此策略将 old snapshot 从 ~7,000 tokens/条 降到 ~50 tokens/条，大幅降低长 run 的 TPM 压力。
+
+**DB Sub-Agent 独立 context**：DB 验证在独立的 `Runner.run()` 里执行，context 从零开始，不携带 UI 流程的任何历史，单次请求仅 ~3-5K tokens。
+
+**Rate limit retry**：所有 LLM client 设置 `max_retries=5`，SDK 内部对 429 自动指数退避重试，不重启场景。
+
+## DB Schema Cache
+
+DB Sub-Agent 第一次运行时会调用 `describe_table` 探索表结构，结果自动缓存到本地 JSON 文件：
+
+```
+memory/db_schema_{project_name}.json
+```
+
+后续运行直接从 cache 读取列名注入 prompt，跳过 schema 探索，减少 2-3 次 LLM 调用。Cache 按 `database.table` 为 key 存储，有新表时自动追加。
 
 ---
 
@@ -328,6 +349,7 @@ mcp_servers:
       - browser_take_screenshot
   database:
     enabled: true
+    role: database                              # 标记为 DB server，路由给 DB Sub-Agent
     command: "node"
     args: ["./mcp-servers/db-mcp/index.js"]
     env:
@@ -336,8 +358,6 @@ mcp_servers:
       DB_PORT_ENV: "DB_PORT"
       DB_USER_ENV: "DB_USER"
       DB_PASSWORD_ENV: "DB_PASSWORD"
-      DB_ALIASES_ENV: "DB_ALIASES"
-
 # --- 边界 ---
 boundaries:
   readonly: true
@@ -373,6 +393,8 @@ src/universal_debug_agent/
 │   ├── profile.py           # ProjectProfile + ModelConfig + BoundariesConfig 等
 │   └── report.py            # ScenarioReport + ScenarioStep + DataVerification
 ├── agents/
+│   ├── brain.py             # create_brain_agent（ReAct + Analysis 模式）
+│   ├── db_agent.py          # DB Sub-Agent（verify_in_db 工具内部调用）
 │   └── prompts.py           # System prompts（ReAct + Analysis 双模式）
 ├── orchestrator/
 │   ├── state_machine.py     # InvestigationOrchestrator + StuckDetector
@@ -393,6 +415,7 @@ src/universal_debug_agent/
 └── tools/
     ├── auth_tools.py        # get_test_account(role) — 从 profile 读测试账号
     ├── code_tools.py        # read_file / grep_code / list_directory（沙箱化）
+    ├── db_tool.py           # verify_in_db — 触发 DB Sub-Agent；管理 schema cache
     └── report_tool.py       # submit_report — 结构化报告提交，退出 ReAct 循环
 ```
 
