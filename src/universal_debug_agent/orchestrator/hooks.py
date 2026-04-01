@@ -101,18 +101,25 @@ class SwitchToAnalysisMode(Exception):
 class InvestigationHooks(RunHooks):
     """Hooks that track tool calls and trigger mode switch when stuck."""
 
+    # Tools that change page state — refs from their snapshot are stale after page reload
+    _PAGE_CHANGING_TOOLS = {"browser_click", "browser_navigate"}
+
     def __init__(
         self,
         stuck_detector: Any,
         evidence_collector: Any,
         trace_recorder: ExecutionTraceRecorder | None = None,
+        playwright_server: Any = None,
     ):
         self.stuck_detector = stuck_detector
         self.evidence_collector = evidence_collector
         self.trace_recorder = trace_recorder
+        self._playwright_server = playwright_server
         # Buffer function_call args from LLM responses for use in on_tool_start.
         # context.tool_arguments is unreliable for MCP tools; the LLM response is authoritative.
         self._pending_tool_args: dict[str, list[str]] = {}
+        # Auto-snapshot captured after click/navigate — consumed by input_filters
+        self.pending_auto_snapshot: str | None = None
 
     async def on_llm_end(
         self, context: RunContextWrapper, agent: Agent, response
@@ -173,6 +180,10 @@ class InvestigationHooks(RunHooks):
 
         logger.info(f"[result]  {tool_name} -> {_summarize_tool_result(tool_name, result_str)}")
 
+        # Auto-snapshot after page-changing actions to ensure fresh refs
+        if tool_name in self._PAGE_CHANGING_TOOLS and self._playwright_server is not None:
+            await self._auto_snapshot_after_action(tool_name)
+
         if self.stuck_detector.is_stuck():
             reason = self.stuck_detector.stuck_reason()
             logger.warning(f"[stuck]  {reason}")
@@ -186,6 +197,34 @@ class InvestigationHooks(RunHooks):
                 evidence_summary=self.evidence_collector.build_summary(),
                 reason=reason,
             )
+
+    async def _auto_snapshot_after_action(self, tool_name: str) -> None:
+        """Auto-capture a fresh snapshot after click/navigate.
+
+        Page-changing actions (click, navigate) may trigger full page reloads
+        (e.g. traditional form POST). The snapshot in the click result is captured
+        BEFORE the reload, so its refs are stale. We capture a fresh snapshot here
+        and store it so the input_filter can inject it into the LLM's next input,
+        giving the model correct refs without requiring it to manually call
+        browser_snapshot.
+        """
+        try:
+            result = await self._playwright_server.call_tool(
+                "browser_snapshot",
+                {"depth": 10},
+            )
+            # Extract text content from MCP result
+            content = getattr(result, "content", result)
+            if isinstance(content, list):
+                for item in content:
+                    text = getattr(item, "text", None) or (item.get("text") if isinstance(item, dict) else None)
+                    if text and "```yaml" in text:
+                        self.pending_auto_snapshot = text
+                        logger.info(f"[auto-snapshot] captured fresh snapshot after {tool_name}")
+                        return
+            logger.warning(f"[auto-snapshot] no yaml content in snapshot result after {tool_name}")
+        except Exception as e:
+            logger.warning(f"[auto-snapshot] failed after {tool_name}: {e}")
 
     def _tool_args(self, context: RunContextWrapper, tool: Tool) -> str:
         if hasattr(context, "tool_arguments"):

@@ -54,6 +54,7 @@ _playwright_server: MCPServerStdio | None = None
 _allowed_domains: list[str] = []
 _evidence_collector: Any = None  # EvidenceCollector instance
 _code_root_dir: str = ""
+_usage_tracker: Any = None  # LLMUsageTracker instance
 
 
 def configure(
@@ -65,9 +66,10 @@ def configure(
     allowed_domains: list[str] | None = None,
     evidence_collector: Any = None,
     code_root_dir: str = "",
+    usage_tracker: Any = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir, _usage_tracker
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
@@ -76,6 +78,7 @@ def configure(
     _allowed_domains = allowed_domains or []
     _evidence_collector = evidence_collector
     _code_root_dir = code_root_dir
+    _usage_tracker = usage_tracker
 
 
 def _load_schema_cache() -> dict:
@@ -234,6 +237,64 @@ def _build_workflow_summary() -> str:
     return "\n".join(lines)
 
 
+def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str) -> str:
+    """Filter schema cache to tables matching keywords from the context.
+
+    Extracts keywords from UI data, workflow summary, and network log,
+    then returns only matching table schemas. This gives the DB agent
+    enough schema context to write SQL without injecting all 510 tables.
+    """
+    cache = _load_schema_cache()
+    if not cache:
+        return ""
+
+    # Build keyword set from all available context
+    context = f"{data_json} {workflow_summary} {network_log}".lower()
+
+    # Extract meaningful words (skip very short/common ones)
+    words = set(re.findall(r"[a-z_]{3,}", context))
+    # Add compound terms that might match table names
+    keywords = set()
+    for w in words:
+        keywords.add(w)
+        # Split on underscore to catch partial matches: "newsletter_type" → "newsletter", "type"
+        for part in w.split("_"):
+            if len(part) >= 3:
+                keywords.add(part)
+
+    # Always include common business tables
+    keywords.update({"order", "orders", "customer", "customers", "payment", "product"})
+
+    # Match tables whose name contains any keyword
+    matched: dict[str, str] = {}
+    for db_table, schema in cache.items():
+        table_name = db_table.split(".")[-1].lower()
+        if any(kw in table_name for kw in keywords):
+            matched[db_table] = schema
+
+    if not matched:
+        return ""
+
+    # Cap at ~20 tables to keep token budget reasonable
+    if len(matched) > 20:
+        # Shorter table names are more likely core business tables
+        # (e.g. "customers" > "customers_basket_attributes")
+        scored = sorted(
+            matched.items(),
+            key=lambda kv: len(kv[0].split(".")[-1]),
+        )
+        matched = dict(scored[:20])
+
+    lines = ["## Relevant DB Schema (from cache — skip describe_table for these)"]
+    for db_table, columns in sorted(matched.items()):
+        lines.append(f"\n### {db_table}")
+        lines.append(columns)
+
+    result = "\n".join(lines)
+    logger.info(f"[db] schema hint: {len(matched)} tables matched from {len(cache)} cached")
+    return result
+
+
 def _parse_describe_result(result_str: str) -> str:
     """Parse describe_table result into a clean column summary string.
 
@@ -365,18 +426,22 @@ async def verify_in_db(data_json: str) -> str:
 
     network_log = await _fetch_network_log()
     workflow_summary = _build_workflow_summary()
+    schema_hint = _filter_schema_cache(data_json, workflow_summary, network_log)
     db_agent = create_db_agent(
         mcp_servers=_db_mcp_servers,
         model=_model,
         network_log=network_log,
         workflow_summary=workflow_summary,
         code_root_dir=_code_root_dir,
+        schema_hint=schema_hint,
     )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
     if network_log:
         logger.info(f"[db] injecting network log ({len(network_log)} chars)")
     if workflow_summary:
         logger.info(f"[db] injecting workflow summary ({len(workflow_summary)} chars)")
+    if schema_hint:
+        logger.info(f"[db] injecting schema hint ({len(schema_hint)} chars)")
 
     # Record everything passed to DB agent in the trace for debugging
     if _trace_recorder is not None:
@@ -385,7 +450,8 @@ async def verify_in_db(data_json: str) -> str:
             "DB Agent Handoff",
             f"## UI Data\n{data_json}\n\n"
             f"## Workflow Summary\n{workflow_summary or '(none)'}\n\n"
-            f"## Network Log\n{network_log or '(none)'}",
+            f"## Network Log\n{network_log or '(none)'}\n\n"
+            f"## Schema Hint\n{schema_hint or '(none)'}",
         )
 
     try:
@@ -396,6 +462,8 @@ async def verify_in_db(data_json: str) -> str:
             hooks=_DBHooks(_trace_recorder),
             run_config=RunConfig(),
         )
+        if _usage_tracker is not None:
+            _usage_tracker.record_run_result(result, phase="db_verify")
         output = result.final_output
         if isinstance(output, DBVerificationOutput):
             return json.dumps([v.model_dump() for v in output.verifications], default=str)

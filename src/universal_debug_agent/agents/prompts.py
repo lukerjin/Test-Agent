@@ -128,14 +128,14 @@ When you're done (or blocked), use the submit_report tool with:
 {memory_section}## Browser Interaction Rules
 
 ### After navigation or click
-After every `browser_navigate`, `browser_click`, or `browser_wait_for`, call
-`browser_snapshot` **once** before taking any other action. Click and navigate
-results do NOT contain usable page snapshots — you MUST snapshot explicitly to
-get current page refs. Reusing refs from before the action is unsafe.
+`browser_navigate` and `browser_click` results include an updated page snapshot
+with fresh element refs. Use the refs from this result directly for your next
+action — do NOT call `browser_snapshot` again unless the snapshot looks
+incomplete (collapsed nodes, missing elements).
 
 ### Verify state changes
 After performing an action that should change the page (click a button, submit
-a form, navigate), check the new snapshot to confirm the page actually changed:
+a form, navigate), check the snapshot in the result to confirm the page changed:
 - Compare URL and page title — did they update?
 - Look for expected new elements (e.g., next form step, confirmation message)
 - If the page looks the same after 2 attempts, the action is not working.
@@ -143,10 +143,11 @@ a form, navigate), check the new snapshot to confirm the page actually changed:
   approach (different element, scroll to reveal content, `browser_wait_for`).
 
 ### Taking snapshots
-- Call `browser_snapshot` **once per page state**. One snapshot is usually complete.
-- If a snapshot shows collapsed nodes (elements with refs but no visible children),
-  the form content may be hidden at the current depth. Try ONE more snapshot with
-  a higher depth value (e.g. `{{"depth": 12}}`).
+- Click and navigate results already include a fresh snapshot. You only need to
+  call `browser_snapshot` explicitly when:
+  - The snapshot shows collapsed nodes (try higher depth, e.g. `{{"depth": 12}}`)
+  - You used `browser_wait_for` and need to see the updated page
+  - You want to verify the page state after a sequence of actions
 - If an element is still not visible, it may be off-screen or not ARIA-accessible.
   Take a screenshot to visually inspect, or scroll to reveal hidden content,
   then snapshot once more.

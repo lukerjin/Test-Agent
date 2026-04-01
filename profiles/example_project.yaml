@@ -98,6 +98,8 @@ mcp_servers:
     command: "node"
     args: ["./path/to/your/db-mcp/index.js"]
     cache_tools_list: true
+    blocked_tools:
+      - describe_all_tables
     env:
       DB_HOST_ENV: "DB_HOST"
       DB_PORT_ENV: "DB_PORT"
