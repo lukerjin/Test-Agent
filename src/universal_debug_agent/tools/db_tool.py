@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from pathlib import Path
 from typing import Any
 
@@ -51,6 +52,8 @@ _trace_recorder: ExecutionTraceRecorder | None = None
 _cache_path: Path | None = None
 _playwright_server: MCPServerStdio | None = None
 _allowed_domains: list[str] = []
+_evidence_collector: Any = None  # EvidenceCollector instance
+_code_root_dir: str = ""
 
 
 def configure(
@@ -60,15 +63,19 @@ def configure(
     cache_path: Path | None = None,
     playwright_server: MCPServerStdio | None = None,
     allowed_domains: list[str] | None = None,
+    evidence_collector: Any = None,
+    code_root_dir: str = "",
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
     _cache_path = cache_path
     _playwright_server = playwright_server
     _allowed_domains = allowed_domains or []
+    _evidence_collector = evidence_collector
+    _code_root_dir = code_root_dir
 
 
 def _load_schema_cache() -> dict:
@@ -158,14 +165,72 @@ async def _fetch_network_log() -> str:
     return result_str
 
 
-def _format_cache_for_prompt(cache: dict) -> str:
-    """Format cached schema as a prompt section."""
-    if not cache:
+def _build_workflow_summary() -> str:
+    """Build a compact summary of what the UI agent did, for the DB agent's context."""
+    if _evidence_collector is None or not _evidence_collector.items:
         return ""
-    lines = ["## Cached DB Schema (skip describe_table for these tables)"]
-    for db_table, columns in cache.items():
-        lines.append(f"\n### {db_table}")
-        lines.append(columns)
+
+    lines: list[str] = []
+    for item in _evidence_collector.items:
+        tool = item["tool"]
+        args = item.get("args", "")
+        result = item.get("result_preview", "")
+
+        if tool == "browser_navigate":
+            # Extract URL
+            try:
+                url = json.loads(args).get("url", args)
+            except Exception:
+                url = args
+            lines.append(f"Navigate: {url}")
+
+        elif tool == "browser_click":
+            # Extract element description
+            try:
+                parsed = json.loads(args)
+                element = parsed.get("element", parsed.get("ref", args))
+            except Exception:
+                element = args[:80]
+            lines.append(f"Click: {element}")
+
+        elif tool in ("browser_type", "browser_fill_form"):
+            # Extract what was filled (redact passwords)
+            try:
+                parsed = json.loads(args)
+                if "fields" in parsed:
+                    fields = [f.get("name", "?") for f in parsed["fields"]]
+                    lines.append(f"Fill form: {', '.join(fields)}")
+                else:
+                    ref = parsed.get("ref", "?")
+                    text = parsed.get("text", "")
+                    if "password" in args.lower():
+                        text = "***"
+                    lines.append(f"Type: ref={ref} text={text[:50]}")
+            except Exception:
+                lines.append(f"Type: {args[:60]}")
+
+        elif tool == "browser_select_option":
+            lines.append(f"Select: {args[:80]}")
+
+        elif tool == "browser_snapshot":
+            # Extract page URL from result
+            url_match = re.search(r"Page URL:\s*(\S+)", result)
+            if url_match:
+                lines.append(f"Page: {url_match.group(1)}")
+
+        elif tool == "browser_take_screenshot":
+            lines.append("Screenshot taken")
+
+        elif tool == "get_test_account":
+            lines.append(f"Get test account: {args}")
+
+    if not lines:
+        return ""
+
+    # Cap at ~30 lines to keep it compact
+    if len(lines) > 30:
+        lines = lines[:15] + [f"... ({len(lines) - 30} steps omitted) ..."] + lines[-15:]
+
     return "\n".join(lines)
 
 
@@ -298,19 +363,20 @@ async def verify_in_db(data_json: str) -> str:
             "severity": "high",
         }])
 
-    schema_cache = _format_cache_for_prompt(_load_schema_cache())
     network_log = await _fetch_network_log()
+    workflow_summary = _build_workflow_summary()
     db_agent = create_db_agent(
         mcp_servers=_db_mcp_servers,
         model=_model,
-        schema_cache=schema_cache,
         network_log=network_log,
+        workflow_summary=workflow_summary,
+        code_root_dir=_code_root_dir,
     )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
-    if schema_cache:
-        logger.info(f"[db] injecting cached schema ({len(schema_cache)} chars)")
     if network_log:
         logger.info(f"[db] injecting network log ({len(network_log)} chars)")
+    if workflow_summary:
+        logger.info(f"[db] injecting workflow summary ({len(workflow_summary)} chars)")
 
     # Record everything passed to DB agent in the trace for debugging
     if _trace_recorder is not None:
@@ -318,8 +384,8 @@ async def verify_in_db(data_json: str) -> str:
             "db_handoff",
             "DB Agent Handoff",
             f"## UI Data\n{data_json}\n\n"
-            f"## Network Log\n{network_log or '(none)'}\n\n"
-            f"## Schema Cache\n{schema_cache or '(none)'}",
+            f"## Workflow Summary\n{workflow_summary or '(none)'}\n\n"
+            f"## Network Log\n{network_log or '(none)'}",
         )
 
     try:

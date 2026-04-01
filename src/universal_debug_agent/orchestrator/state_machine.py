@@ -217,6 +217,8 @@ class InvestigationOrchestrator:
             cache_path=cache_path,
             playwright_server=playwright_server,
             allowed_domains=profile.boundaries.allowed_domains,
+            evidence_collector=self.evidence_collector,
+            code_root_dir=profile.code.root_dir,
         )
 
     @staticmethod
