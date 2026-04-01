@@ -26,6 +26,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from universal_debug_agent.config import load_profile
+from universal_debug_agent.schemas.profile import ScenarioConfig
 from universal_debug_agent.mcp.factory import create_mcp_servers
 from universal_debug_agent.memory.store import MemoryRecord, MemoryStore, resolve_memory_path
 from universal_debug_agent.models.factory import create_model
@@ -132,6 +133,7 @@ async def _run_test(
     output: str | None,
     max_steps: int | None,
     verbose: bool,
+    db_checks: list[str] | None = None,
 ) -> None:
     # Setup logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -208,6 +210,7 @@ async def _run_test(
         memory_context=memory_context,
         usage_tracker=usage_tracker,
         trace_recorder=trace_recorder,
+        db_checks=db_checks,
     )
 
     try:
@@ -322,16 +325,23 @@ def test(
     """Execute a test scenario on the target application."""
 
     # Resolve named scenario from profile
+    db_checks: list[str] | None = None
     try:
         _profile = load_profile(profile)
         if scenario and scenario in _profile.scenarios:
-            scenario = _profile.scenarios[scenario]
+            cfg = _profile.scenarios[scenario]
+            if isinstance(cfg, ScenarioConfig):
+                scenario = cfg.description
+                db_checks = cfg.db_checks or None
+            else:
+                scenario = cfg
         elif not scenario:
             if _profile.scenarios:
                 table = Table(title="Available Scenarios", show_header=True)
                 table.add_column("Name", style="cyan")
                 table.add_column("Description", style="white")
-                for name, desc in _profile.scenarios.items():
+                for name, cfg in _profile.scenarios.items():
+                    desc = cfg.description if isinstance(cfg, ScenarioConfig) else cfg
                     table.add_row(name, desc)
                 console.print(table)
                 console.print("\n[yellow]Run with:[/yellow] -s <name>")
@@ -352,6 +362,7 @@ def test(
             output=output,
             max_steps=max_steps,
             verbose=verbose,
+            db_checks=db_checks,
         ))
     except (RateLimitError, APIStatusError) as e:
         provider = "LLM"

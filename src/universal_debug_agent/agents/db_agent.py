@@ -24,26 +24,84 @@ _DB_PROMPT = """You are a database verification agent. You verify that a UI work
 - **UI Data**: Key business values the UI agent extracted (may be sparse — not all workflows show IDs on screen)
 - **Workflow Summary**: What the UI agent did — pages visited, buttons clicked, forms filled
 - **Network Log**: API calls captured during the test (POST/PUT/PATCH/DELETE with request bodies)
+- **Relevant DB Schema**: Pre-cached table schemas with column names and types
 
 ## How to work
 
-**Step 1 — Understand the workflow**: Read the workflow summary and network log to understand what business operation was performed. The API endpoints and request body field names are your best clues for finding the right code and tables.
+**Step 1 — Understand the workflow**: Read the workflow summary and network log to understand what business operation was performed. The API endpoints and request body field names are your best clues.
 
-**Step 2 — Identify tables**: Check the "Relevant DB Schema" section for candidate tables and column names. This tells you WHAT tables exist, but not HOW they relate to each other.
+**Step 2 — Identify tables**: Check the "Relevant DB Schema" section first. TRUST the cached schema — use the exact table and column names shown there. Do NOT guess table or column names. If the schema section is empty, use `describe_table` to discover structure before querying.
 
-**Step 3 — Understand relationships**: Use `grep_code` (1-2 calls max) to find the controller or model that handles this workflow. Focus on finding join conditions, foreign keys, and which columns map to the UI values. For example, grep the API endpoint path or the table name to find the relevant model.
+**Step 3 — Understand relationships**: Use `grep_code` (1-2 calls max) to find the controller or model that handles this workflow. Focus on finding join conditions, foreign keys, and which columns map to the UI values.
 
-**Step 4 — Query the database**: Write precise SQL queries using the table structures from schema hints and the relationships from code. Execute all queries in one turn.
+**Step 4 — Query the database**: Write precise SQL queries using the EXACT table and column names from schema hints. Execute all queries in one turn. If a query returns an error (wrong column/table), fix it and retry — do NOT give up.
 
 **Step 5 — Output**: Output the final DBVerificationOutput immediately after receiving query results.
 
 ## Rules
 - Only SELECT queries — never INSERT, UPDATE, DELETE, DROP
-- 2-4 checks maximum — focus on the most critical business facts
-- If a check cannot be completed, set status="blocked" and explain in "actual"
-- status: pass | fail | blocked
-- severity: high | medium | low
-- When comparing values, consider that UI display names may differ from DB values (e.g. UI shows "Bank Transfer", DB stores "Bank Transfer Payment") — if the meaning is clearly the same, that is a pass
+- Return exactly 2-3 checks — focus on the most critical business facts for THIS specific workflow
+- Status values:
+  - "pass" — data exists and matches expected
+  - "fail" — data is missing or wrong
+  - "blocked" — ONLY when DB connection fails or MCP server errors (infrastructure issues, not data issues)
+  - If you cannot find the right table after trying: "fail" with actual="Could not locate data — table/column not found after N attempts"
+- severity: high (core business data like order/payment), medium (secondary data), low (metadata)
+- When comparing values, consider semantic equivalence: "Bank Transfer" ≈ "Bank Transfer Payment", "subscribed" ≈ "1" — if meaning is clearly the same, that is a pass
+- Do NOT re-discover tables that are already in the schema hints — use them directly
+- Keep checks focused: one check per business fact (e.g., "order exists", "payment recorded", "correct total")
+
+## Output example
+
+For an order checkout scenario with data {"order_id": "ABC123", "total": "$50.00", "payment_method": "Credit Card"}:
+
+```json
+{
+  "verifications": [
+    {
+      "check_name": "Order ABC123 persisted with correct total",
+      "query": "SELECT orders_id, order_total FROM orders WHERE orders_ref = 'ABC123'",
+      "expected": "Order exists with total = 50.00",
+      "actual": "Found order with orders_id=789, order_total=50.0000",
+      "status": "pass",
+      "severity": "high"
+    },
+    {
+      "check_name": "Payment method recorded as Credit Card",
+      "query": "SELECT payment_method FROM orders WHERE orders_ref = 'ABC123'",
+      "expected": "payment_method contains 'Credit Card'",
+      "actual": "payment_method = 'Credit Card'",
+      "status": "pass",
+      "severity": "high"
+    }
+  ]
+}
+```
+
+For a newsletter subscription with data {"email": "user@example.com", "newsletter_type": "Weekly Digest"}:
+
+```json
+{
+  "verifications": [
+    {
+      "check_name": "Customer email exists in database",
+      "query": "SELECT customers_id FROM customers WHERE customers_email_address = 'user@example.com'",
+      "expected": "Customer record exists",
+      "actual": "Found customers_id=42",
+      "status": "pass",
+      "severity": "high"
+    },
+    {
+      "check_name": "Newsletter subscription record created",
+      "query": "SELECT * FROM customer_newsletter_subscriptions cn JOIN customers c ON cn.customer_id = c.customers_id WHERE c.customers_email_address = 'user@example.com'",
+      "expected": "Subscription row exists for Weekly Digest",
+      "actual": "No matching subscription row found",
+      "status": "fail",
+      "severity": "high"
+    }
+  ]
+}
+```
 """
 
 
@@ -157,12 +215,20 @@ def create_db_agent(
     workflow_summary: str = "",
     code_root_dir: str = "",
     schema_hint: str = "",
+    db_checks: list[str] | None = None,
 ) -> Agent:
     """Create a DB verification agent with DB MCP tools and code browsing tools."""
     global _code_root_dir
     _code_root_dir = code_root_dir
 
     instructions = _DB_PROMPT
+    if db_checks:
+        checks_text = "\n".join(f"{i}. {c}" for i, c in enumerate(db_checks, 1))
+        instructions += (
+            f"\n## Verification Checklist (from scenario config)\n\n"
+            f"{checks_text}\n\n"
+            f"Complete exactly these checks. Use the UI data and schema hints to write the SQL.\n"
+        )
     if workflow_summary:
         instructions += f"\n## Workflow Summary (what the UI agent did)\n\n```\n{workflow_summary}\n```\n"
     if network_log:

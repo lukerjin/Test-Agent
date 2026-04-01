@@ -98,7 +98,7 @@ verify_in_db('{{"order_id": "1234", "total": "268.45", "user_email": "test@examp
 
 - Pass every ID, amount, status, or reference number visible on the confirmation page.
 - The DB agent runs in isolation and returns a JSON array of verification results.
-- Include those results in `data_verifications` when calling `submit_report`.
+- Include those results directly in `data_verifications` when calling `submit_report` — do NOT modify them.
 - You may also call `verify_in_db` mid-flow to check state after a critical step.
 - Do NOT call `verify_in_db` with an empty object — only call it when you have real data.
 

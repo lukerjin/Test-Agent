@@ -90,6 +90,13 @@ class BoundariesConfig(BaseModel):
     filter: FilterConfig = Field(default_factory=FilterConfig)
 
 
+class ScenarioConfig(BaseModel):
+    """A test scenario with optional DB verification hints."""
+
+    description: str
+    db_checks: list[str] = Field(default_factory=list)
+
+
 class ProjectProfile(BaseModel):
     """Root configuration model for a project."""
 
@@ -101,4 +108,4 @@ class ProjectProfile(BaseModel):
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
     mcp_servers: dict[str, MCPServerConfig] = Field(default_factory=dict)
     boundaries: BoundariesConfig = Field(default_factory=BoundariesConfig)
-    scenarios: dict[str, str] = Field(default_factory=dict)  # name -> description
+    scenarios: dict[str, str | ScenarioConfig] = Field(default_factory=dict)

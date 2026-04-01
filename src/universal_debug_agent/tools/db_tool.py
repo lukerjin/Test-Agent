@@ -55,6 +55,7 @@ _allowed_domains: list[str] = []
 _evidence_collector: Any = None  # EvidenceCollector instance
 _code_root_dir: str = ""
 _usage_tracker: Any = None  # LLMUsageTracker instance
+_db_checks: list[str] = []  # Scenario-specific verification hints
 
 
 def configure(
@@ -67,9 +68,10 @@ def configure(
     evidence_collector: Any = None,
     code_root_dir: str = "",
     usage_tracker: Any = None,
+    db_checks: list[str] | None = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir, _usage_tracker
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir, _usage_tracker, _db_checks
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
@@ -79,6 +81,7 @@ def configure(
     _evidence_collector = evidence_collector
     _code_root_dir = code_root_dir
     _usage_tracker = usage_tracker
+    _db_checks = db_checks or []
 
 
 def _load_schema_cache() -> dict:
@@ -434,6 +437,7 @@ async def verify_in_db(data_json: str) -> str:
         workflow_summary=workflow_summary,
         code_root_dir=_code_root_dir,
         schema_hint=schema_hint,
+        db_checks=_db_checks,
     )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
     if network_log:
@@ -442,6 +446,8 @@ async def verify_in_db(data_json: str) -> str:
         logger.info(f"[db] injecting workflow summary ({len(workflow_summary)} chars)")
     if schema_hint:
         logger.info(f"[db] injecting schema hint ({len(schema_hint)} chars)")
+    if _db_checks:
+        logger.info(f"[db] injecting {len(_db_checks)} verification hints from scenario")
 
     # Record everything passed to DB agent in the trace for debugging
     if _trace_recorder is not None:
