@@ -91,6 +91,7 @@ mcp_servers:
       - browser_handle_dialog
       - browser_wait_for
       - browser_take_screenshot
+      - browser_network_requests
   database:
     enabled: true
     role: database

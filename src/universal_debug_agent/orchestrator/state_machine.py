@@ -207,11 +207,16 @@ class InvestigationOrchestrator:
         }
         db_servers = [s for s in mcp_servers if s.name in db_server_names]
         cache_path = Path(f"memory/db_schema_{profile.project.name.replace(' ', '_')}.json")
+        playwright_server = next(
+            (s for s in mcp_servers if s.name == "playwright"), None
+        )
         db_tool.configure(
             db_mcp_servers=db_servers,
             model=model,
             trace_recorder=trace_recorder,
             cache_path=cache_path,
+            playwright_server=playwright_server,
+            allowed_domains=profile.boundaries.allowed_domains,
         )
 
     @staticmethod

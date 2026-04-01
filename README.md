@@ -220,6 +220,36 @@ memory/db_schema_{project_name}.json
 
 后续运行直接从 cache 读取列名注入 prompt，跳过 schema 探索，减少 2-3 次 LLM 调用。Cache 按 `database.table` 为 key 存储，有新表时自动追加。
 
+### 预抓取 Schema Cache
+
+可以在首次运行前批量抓取所有表结构，避免 DB agent 浪费 turn 做 `describe_table`：
+
+```bash
+# 抓指定数据库的所有表
+uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml -d inkstation
+
+# 增量抓取（跳过已缓存的表）
+uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml -d inkstation --skip-cached
+
+# 抓所有数据库（自动跳过 mysql/sys/information_schema/performance_schema）
+uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml
+
+# 自定义输出路径
+uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml -o memory/my_cache.json
+```
+
+脚本连接 profile 中配置的 DB MCP server，优先使用 `describe_all_tables` 一次性获取整个数据库的全部表结构（1 次调用），如果 MCP server 不支持则自动回退到逐表 `describe_table`。结果写入 `memory/db_schema_{project_name}.json`（与 agent 运行时使用的 cache 文件相同）。多次运行会自动合并，不会覆盖已有缓存。
+
+## Network Log 自动注入
+
+当 UI agent 调用 `verify_in_db` 时，系统自动通过 Playwright MCP 获取浏览器的网络请求日志，过滤出业务 API 的 mutation 请求（POST/PUT/PATCH/DELETE），注入 DB agent 的 prompt。
+
+这样 DB agent 可以看到实际的 API 请求体（如 `{"orders_ref": "116NZXM27", "payment_method_id": 5}`），直接知道正确的字段名和表结构映射，无需猜测。
+
+- **自动过滤**：只保留 `allowed_domains` 内的请求，排除第三方（forter、Google Analytics 等）
+- **零额外开销**：UI agent 不需要做任何事，`verify_in_db` 内部自动获取
+- **传统 Form POST**：不走 fetch/XHR 的页面刷新不会被捕获（这类场景依赖 schema cache）
+
 ---
 
 ## CLI 参考
