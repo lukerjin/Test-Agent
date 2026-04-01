@@ -34,6 +34,14 @@ def create_brain_agent(
         evidence_summary: Collected evidence text (only used in analysis mode).
         memory_context: Formatted past test memory for prompt injection.
     """
+    # UI agent only gets non-DB MCP servers (Playwright, etc.).
+    # DB verification goes through verify_in_db which runs a separate DB agent.
+    db_server_names = {
+        name for name, cfg in profile.mcp_servers.items()
+        if cfg.role == "database" or (cfg.role is None and "database" in name.lower())
+    }
+    ui_mcp_servers = [s for s in mcp_servers if s.name not in db_server_names]
+
     if mode == "react":
         instructions = build_react_prompt(profile, memory_context=memory_context)
         tools = [read_file, grep_code, list_directory, get_test_account, verify_in_db, submit_report]
@@ -48,7 +56,7 @@ def create_brain_agent(
     return Agent(
         name="TestAgent",
         instructions=instructions,
-        mcp_servers=mcp_servers,
+        mcp_servers=ui_mcp_servers,
         tools=tools,
         output_type=output_type,
         model=model,
