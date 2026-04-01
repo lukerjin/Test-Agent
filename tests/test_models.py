@@ -13,16 +13,16 @@ from universal_debug_agent.models.factory import _CompatTransport, create_model
 from universal_debug_agent.schemas.profile import ModelConfig
 
 
-def test_openai_returns_string():
+def test_openai_returns_model_with_timeout():
     config = ModelConfig(provider="openai", model_name="gpt-4o")
     result = create_model(config)
-    assert result == "gpt-4o"
+    assert isinstance(result, OpenAIChatCompletionsModel)
 
 
 def test_openai_default_model():
     config = ModelConfig(provider="openai")
     result = create_model(config)
-    assert result == "gpt-4o"
+    assert isinstance(result, OpenAIChatCompletionsModel)
 
 
 def test_gemini_returns_model_instance():

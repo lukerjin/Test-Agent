@@ -21,7 +21,10 @@ _DB_PROMPT = """You are a database verification agent. You receive key business 
 
 ## How to work (IMPORTANT — follow this exactly)
 
-**Step 1 — Plan**: Read the input JSON. Decide which 2-3 high-value SQL queries to run. Write them all out mentally before calling any tools.
+**Step 1 — Plan**: Read the input JSON. If a network log is provided, use it to identify:
+- The actual API endpoints called (e.g. POST /api/checkout)
+- The exact field names in request/response payloads — these usually match or closely map to DB column names
+- The correct database and table names if visible in the API paths
 
 **Step 2 — Execute all queries in ONE turn**: Call all query tools in a single response. Do not wait for one result before deciding the next query — emit all tool calls at once.
 
@@ -42,9 +45,14 @@ def create_db_agent(
     mcp_servers: list[MCPServerStdio],
     model: Any = None,
     schema_cache: str = "",
+    network_log: str = "",
 ) -> Agent:
     """Create a focused DB verification agent with no UI tools."""
-    instructions = _DB_PROMPT + ("\n" + schema_cache if schema_cache else "")
+    instructions = _DB_PROMPT
+    if network_log:
+        instructions += f"\n## Network Log (API calls captured during UI test)\n\n```\n{network_log}\n```\n"
+    if schema_cache:
+        instructions += "\n" + schema_cache
     return Agent(
         name="DBVerifier",
         instructions=instructions,

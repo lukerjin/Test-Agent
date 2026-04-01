@@ -32,11 +32,15 @@ def _serialize_tool_result(result: Any) -> str:
         for item in result:
             if isinstance(item, dict) and "text" in item:
                 parts.append(item["text"])
+            elif hasattr(item, "text"):
+                parts.append(item.text)
             else:
                 parts.append(str(item))
         return "\n".join(parts)
     if isinstance(result, dict) and "text" in result:
         return result["text"]
+    if hasattr(result, "text"):
+        return result.text
     return str(result)
 
 
@@ -45,6 +49,8 @@ _db_mcp_servers: list[MCPServerStdio] = []
 _model: Any = None
 _trace_recorder: ExecutionTraceRecorder | None = None
 _cache_path: Path | None = None
+_playwright_server: MCPServerStdio | None = None
+_allowed_domains: list[str] = []
 
 
 def configure(
@@ -52,13 +58,17 @@ def configure(
     model: Any,
     trace_recorder: ExecutionTraceRecorder | None = None,
     cache_path: Path | None = None,
+    playwright_server: MCPServerStdio | None = None,
+    allowed_domains: list[str] | None = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
     _cache_path = cache_path
+    _playwright_server = playwright_server
+    _allowed_domains = allowed_domains or []
 
 
 def _load_schema_cache() -> dict:
@@ -78,6 +88,74 @@ def _save_schema_cache(cache: dict) -> None:
         _cache_path.write_text(json.dumps(cache, indent=2, ensure_ascii=False))
     except Exception as e:
         logger.warning(f"[db] failed to save schema cache: {e}")
+
+
+async def _fetch_network_log() -> str:
+    """Call browser_network_requests on the Playwright MCP server to get API calls.
+
+    Fetches all network requests with request bodies included, then filters to
+    mutation requests (POST/PUT/PATCH/DELETE) which reveal the data contract
+    between UI and backend — field names in payloads usually match DB columns.
+    """
+    if _playwright_server is None:
+        return ""
+
+    try:
+        result = await _playwright_server.call_tool(
+            "browser_network_requests",
+            {"requestBody": True, "requestHeaders": False, "static": False},
+        )
+    except Exception as e:
+        logger.warning(f"[db] failed to fetch network log: {e}")
+        return ""
+
+    # Extract text from the MCP result
+    raw = _serialize_tool_result(getattr(result, "content", result))
+    if not raw:
+        return ""
+
+    # Known third-party paths / domains to exclude from network log
+    _NOISE_PATTERNS = (
+        "/forter/", "forter.com",
+        "google.com/", "google.com.au/",
+        "googleads.", "googlesyndication.",
+        "/tracking", "/collect", "/log",
+        "/ccm/collect", "/rmkt/collect",
+        "facebook.com", "facebook.net",
+        "analytics", "gtag", "gtm",
+    )
+
+    # Filter to mutation requests (POST/PUT/PATCH/DELETE), skip third-party noise
+    mutations: list[str] = []
+    last_was_mutation = False
+    for line in raw.splitlines():
+        line_stripped = line.strip()
+        if any(line_stripped.startswith(f"[{m}]") for m in ("POST", "PUT", "PATCH", "DELETE")):
+            # Skip known third-party / tracking requests
+            lower = line_stripped.lower()
+            if any(p in lower for p in _NOISE_PATTERNS):
+                last_was_mutation = False
+                continue
+            # Domain filter: only keep requests to our app's domains
+            if _allowed_domains and not any(d in line_stripped for d in _allowed_domains):
+                last_was_mutation = False
+                continue
+            mutations.append(line_stripped)
+            last_was_mutation = True
+        # Keep "Request body:" lines that follow a kept mutation request
+        elif line_stripped.startswith("Request body:") and last_was_mutation:
+            mutations.append("  " + line_stripped)
+        else:
+            last_was_mutation = False
+
+    if not mutations:
+        return ""
+
+    result_str = "\n".join(mutations)
+    if len(result_str) > 3000:
+        result_str = result_str[:3000] + "\n... (truncated)"
+
+    return result_str
 
 
 def _format_cache_for_prompt(cache: dict) -> str:
@@ -221,14 +299,28 @@ async def verify_in_db(data_json: str) -> str:
         }])
 
     schema_cache = _format_cache_for_prompt(_load_schema_cache())
+    network_log = await _fetch_network_log()
     db_agent = create_db_agent(
         mcp_servers=_db_mcp_servers,
         model=_model,
         schema_cache=schema_cache,
+        network_log=network_log,
     )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
     if schema_cache:
         logger.info(f"[db] injecting cached schema ({len(schema_cache)} chars)")
+    if network_log:
+        logger.info(f"[db] injecting network log ({len(network_log)} chars)")
+
+    # Record everything passed to DB agent in the trace for debugging
+    if _trace_recorder is not None:
+        _trace_recorder.record(
+            "db_handoff",
+            "DB Agent Handoff",
+            f"## UI Data\n{data_json}\n\n"
+            f"## Network Log\n{network_log or '(none)'}\n\n"
+            f"## Schema Cache\n{schema_cache or '(none)'}",
+        )
 
     try:
         result = await Runner.run(

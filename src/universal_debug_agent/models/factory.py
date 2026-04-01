@@ -105,10 +105,18 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
     provider = config.provider
     model_name = config.model_name or _PROVIDER_DEFAULT_MODELS.get(provider, "gpt-4o")
 
-    # Native OpenAI — return model name string; SDK client uses default max_retries=2
-    # which already handles transient 429s internally without restarting the run.
+    # Native OpenAI — use explicit client with timeout to prevent infinite hangs.
     if provider == "openai" and not config.base_url:
-        return model_name
+        api_key = _resolve_api_key(config)
+        client = AsyncOpenAI(
+            api_key=api_key,
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            max_retries=2,
+        )
+        return OpenAIChatCompletionsModel(
+            model=model_name,
+            openai_client=client,
+        )
 
     # Resolve API key
     api_key = _resolve_api_key(config)
@@ -123,10 +131,12 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
 
     needs_compat = provider in _STRIP_STRICT_PROVIDERS or config.base_url
 
+    timeout = httpx.Timeout(60.0, connect=10.0)
+
     if needs_compat:
         # Use custom transport to strip unsupported fields at HTTP level
         transport = _CompatTransport(httpx.AsyncHTTPTransport())
-        http_client = httpx.AsyncClient(transport=transport)
+        http_client = httpx.AsyncClient(transport=transport, timeout=timeout)
         client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
@@ -137,6 +147,7 @@ def create_model(config: ModelConfig) -> str | OpenAIChatCompletionsModel:
         client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
+            timeout=timeout,
             max_retries=5,
         )
 
