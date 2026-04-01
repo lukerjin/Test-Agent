@@ -29,14 +29,13 @@ _DB_PROMPT = """You are a database verification agent. You verify that a UI work
 
 **Step 1 — Understand the workflow**: Read the workflow summary and network log to understand what business operation was performed. The API endpoints and request body field names are your best clues for finding the right code and tables.
 
-**Step 2 — Find the code path**: Use `grep_code` to find the controller/model/service that handles the API endpoint or business logic. For example:
-- Network log shows `POST /ajaxblocks/cart/add/16227` → grep for "cart/add" or the route name
-- Workflow shows "clicked checkbox Shopping Cart Reminder Email" → grep for "newsletter" or "reminder"
-- Read the relevant code to find which tables and columns are written to
+**Step 2 — Identify tables**: Check the "Relevant DB Schema" section for candidate tables and column names. This tells you WHAT tables exist, but not HOW they relate to each other.
 
-**Step 3 — Query the database**: Based on what you found in the code, write precise SQL queries. Use `describe_table` if you need to confirm column names. Execute all queries in one turn.
+**Step 3 — Understand relationships**: Use `grep_code` (1-2 calls max) to find the controller or model that handles this workflow. Focus on finding join conditions, foreign keys, and which columns map to the UI values. For example, grep the API endpoint path or the table name to find the relevant model.
 
-**Step 4 — Output**: Output the final DBVerificationOutput immediately after receiving query results.
+**Step 4 — Query the database**: Write precise SQL queries using the table structures from schema hints and the relationships from code. Execute all queries in one turn.
+
+**Step 5 — Output**: Output the final DBVerificationOutput immediately after receiving query results.
 
 ## Rules
 - Only SELECT queries — never INSERT, UPDATE, DELETE, DROP
@@ -157,6 +156,7 @@ def create_db_agent(
     network_log: str = "",
     workflow_summary: str = "",
     code_root_dir: str = "",
+    schema_hint: str = "",
 ) -> Agent:
     """Create a DB verification agent with DB MCP tools and code browsing tools."""
     global _code_root_dir
@@ -167,6 +167,8 @@ def create_db_agent(
         instructions += f"\n## Workflow Summary (what the UI agent did)\n\n```\n{workflow_summary}\n```\n"
     if network_log:
         instructions += f"\n## Network Log (API calls captured during UI test)\n\n```\n{network_log}\n```\n"
+    if schema_hint:
+        instructions += f"\n{schema_hint}\n"
 
     # Code tools are only available if code_root_dir is set
     tools = []

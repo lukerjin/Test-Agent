@@ -156,6 +156,7 @@ class MCPToolOutputFilter:
     )
     snapshot_filter: bool = True  # set False to revert to char-truncation only
     snapshot_dir: Path | None = None  # playwright output dir for resolving file refs
+    hooks: Any = None  # InvestigationHooks ref — for consuming auto-snapshot
 
     def __post_init__(self) -> None:
         self._base_trimmer = ToolOutputTrimmer(
@@ -204,22 +205,64 @@ class MCPToolOutputFilter:
     def _find_recent_boundary(self, items: list[Any]) -> int:
         """Return the index of the first item in the 'recent' zone.
 
-        Counts function_call_output items from the end. The last
-        ``recent_turns`` outputs are treated as recent (snapshot-filter only);
-        everything before that index is old (snapshot stripped + char-truncated).
+        The basic rule: the last ``recent_turns`` function_call_output items
+        are "recent" (snapshot-filter only); everything before is "old"
+        (snapshot stripped + char-truncated).
 
-        Using role=="user" is wrong for the Responses API: the initial user
-        message sits at index 0, making every subsequent item "recent" and
-        preventing any stripping of old snapshots.
+        **Same-page extension**: if earlier outputs are on the same page URL
+        as the most recent snapshot, they stay "recent" too. This prevents
+        stripping a snapshot when the agent does same-page actions (fill form,
+        type) that don't change the URL — those actions don't produce new
+        snapshots, so the earlier snapshot's refs are still valid.
         """
+        # Pass 1: find the basic boundary by counting outputs from the end
+        basic_boundary = 0
         output_count = 0
         for i in range(len(items) - 1, -1, -1):
             item = items[i]
             if isinstance(item, dict) and item.get("type") == "function_call_output":
                 output_count += 1
                 if output_count >= self.recent_turns:
-                    return i
-        return 0  # fewer outputs than recent_turns → all recent
+                    basic_boundary = i
+                    break
+
+        # Pass 2: find the most recent page URL, scanning from the end across ALL outputs.
+        # Some tools (fill_form, type) don't include a Page URL in their output,
+        # so we need to look further back to find the URL from the last snapshot/navigate.
+        current_url = None
+        for i in range(len(items) - 1, -1, -1):
+            item = items[i]
+            if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                continue
+            output_str = _serialize_output(item.get("output", ""))
+            url_match = re.search(r"Page URL:\s*(\S+)", output_str)
+            if url_match:
+                current_url = url_match.group(1).strip()
+                break
+
+        if not current_url:
+            return basic_boundary
+
+        # Pass 3: extend boundary backwards to include all outputs on the same URL.
+        # Outputs without a URL (fill_form, type) are assumed to be on the same page
+        # as the nearest output that does have a URL.
+        extended_boundary = basic_boundary
+        for i in range(basic_boundary - 1, -1, -1):
+            item = items[i]
+            if not isinstance(item, dict) or item.get("type") != "function_call_output":
+                continue
+            output_str = _serialize_output(item.get("output", ""))
+            url_match = re.search(r"Page URL:\s*(\S+)", output_str)
+            if url_match:
+                if url_match.group(1).strip() == current_url:
+                    extended_boundary = i
+                else:
+                    break  # Different page — stop extending
+            else:
+                # No URL in this output (e.g. fill_form, type) — assume same page
+                extended_boundary = i
+
+        return extended_boundary
 
     def _build_call_id_to_names(self, items: list[Any]) -> dict[str, tuple[str, ...]]:
         mapping: dict[str, tuple[str, ...]] = {}
@@ -289,7 +332,27 @@ class MCPToolOutputFilter:
         lowered = " ".join(tool_names).lower()
         if not any(m in lowered for m in ("browser_", "playwright", "navigate", "snapshot")):
             return item
-        output_str = self._resolve_snapshot_refs(output_str)
+
+        # If hooks captured a fresh auto-snapshot after click/navigate,
+        # use it instead of the stale file-ref snapshot in the tool result.
+        # This ensures the model sees post-reload refs, not pre-reload ones.
+        if (
+            self.hooks is not None
+            and getattr(self.hooks, "pending_auto_snapshot", None)
+            and any(t in lowered for t in ("browser_click", "browser_navigate"))
+        ):
+            auto_snap = self.hooks.pending_auto_snapshot
+            self.hooks.pending_auto_snapshot = None
+            # Replace the stale snapshot section with the fresh one
+            output_str = re.sub(
+                r"### Snapshot\n.*$",
+                auto_snap,
+                output_str,
+                flags=re.DOTALL,
+            )
+        else:
+            output_str = self._resolve_snapshot_refs(output_str)
+
         filtered = _extract_interactive_snapshot(output_str, max_lines=None)
         if not filtered:
             return item

@@ -219,6 +219,7 @@ class InvestigationOrchestrator:
             allowed_domains=profile.boundaries.allowed_domains,
             evidence_collector=self.evidence_collector,
             code_root_dir=profile.code.root_dir,
+            usage_tracker=usage_tracker,
         )
 
     @staticmethod
@@ -271,11 +272,17 @@ class InvestigationOrchestrator:
         self.state = InvestigationState.REACT
         logger.info("Phase: UI execution")
 
+        playwright_server = next(
+            (s for s in self.mcp_servers if s.name == "playwright"), None
+        )
         hooks = InvestigationHooks(
             stuck_detector=self.stuck_detector,
             evidence_collector=self.evidence_collector,
             trace_recorder=self.trace_recorder,
+            playwright_server=playwright_server,
         )
+        # Connect hooks to filter so auto-snapshots can be injected
+        self._run_config.call_model_input_filter.hooks = hooks
 
         react_agent = create_brain_agent(
             profile=self.profile,
