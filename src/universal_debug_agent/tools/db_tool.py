@@ -412,7 +412,17 @@ async def _fetch_network_log() -> str:
     # Auto-blacklist high-frequency URLs (likely polling, not user actions)
     polling_urls = {url for url, count in url_counts.items() if count > 3}
     if polling_urls:
-        mutations = [m for m in mutations if m not in polling_urls]
+        filtered: list[str] = []
+        skip_body = False
+        for m in mutations:
+            if m in polling_urls:
+                skip_body = True  # skip this URL and its following body lines
+                continue
+            if skip_body and m.startswith("  "):
+                continue  # orphan body line from a removed polling URL
+            skip_body = False
+            filtered.append(m)
+        mutations = filtered
         logger.info(f"[db] filtered {len(polling_urls)} high-frequency polling URLs from network log")
 
     if not mutations:
