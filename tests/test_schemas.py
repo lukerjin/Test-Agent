@@ -2,6 +2,8 @@
 
 from datetime import datetime
 
+import pytest
+
 from universal_debug_agent.schemas.profile import ProjectProfile
 from universal_debug_agent.schemas.report import (
     DataVerification,
@@ -173,3 +175,14 @@ def test_test_report_blocked():
     )
 
     assert report.overall_status == StepStatus.BLOCKED
+
+
+def test_extracted_data_rejects_nested_values():
+    with pytest.raises(Exception):
+        ScenarioReport(
+            scenario_summary="checkout",
+            extracted_data={
+                "order_id": "1234",
+                "details": {"status": "paid"},
+            },
+        )

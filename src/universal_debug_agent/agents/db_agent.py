@@ -40,7 +40,10 @@ _DB_PROMPT = """You are a database verification agent. You verify that a UI work
 
 ## Rules
 - Only SELECT queries — never INSERT, UPDATE, DELETE, DROP
-- Unless a Verification Checklist is provided below, return exactly 2-3 checks — focus on the most critical business facts for THIS specific workflow
+- Treat the current run as source of truth: Verification Checklist, UI Data, Live Schema, current schema hints, and current code all outrank any memory from past runs
+- Reuse DB verification memory ONLY when it clearly matches this workflow/checklist and does not conflict with current schema/code
+- If a Verification Checklist is provided below, complete ONLY those checks — no more, no less. Do NOT invent extra checks.
+- If NO checklist is provided, return checks for the most critical business facts for THIS specific workflow. Only include checks you have evidence for — do NOT invent checks to reach a quota
 - Status values:
   - "pass" — data exists and matches expected
   - "fail" — data is missing or wrong
@@ -224,13 +227,6 @@ def create_db_agent(
     _code_root_dir = code_root_dir
 
     instructions = _DB_PROMPT
-    if verify_memory:
-        instructions += (
-            f"\n{verify_memory}\n\n"
-            f"**Use the memory above as your primary guide** — it contains proven table mappings, "
-            f"joins, and correct column names from previous successful runs. "
-            f"Only fall back to schema hints or grep_code if memory doesn't cover what you need.\n"
-        )
     if db_checks:
         checks_text = "\n".join(f"{i}. {c}" for i, c in enumerate(db_checks, 1))
         instructions += (
@@ -242,6 +238,13 @@ def create_db_agent(
         )
     if live_schema:
         instructions += f"\n{live_schema}\n"
+    if verify_memory:
+        instructions += (
+            f"\n{verify_memory}\n\n"
+            f"Use the memory above only as supplemental guidance from previous successful runs. "
+            f"If the checklist, live schema, cached schema hints, network log, or current code disagree, "
+            f"trust the current run and ignore the memory.\n"
+        )
     if workflow_summary:
         instructions += f"\n## Workflow Summary (what the UI agent did)\n\n```\n{workflow_summary}\n```\n"
     if network_log:

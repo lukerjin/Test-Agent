@@ -143,12 +143,90 @@ def _build_manifest_text(manifest: list[dict]) -> str:
     lines = []
     for i, m in enumerate(manifest):
         desc = m.get("description", "no description")
+        scenario = m.get("scenario", "unknown")
         raw_tables = m.get("tables", [])
         tables = ", ".join(raw_tables) if isinstance(raw_tables, list) else str(raw_tables)
         updated = m.get("updated", "?")
         checks = m.get("checks", 0)
-        lines.append(f"[{i}] {desc} | tables: {tables} | updated: {updated} | checks: {checks}")
+        lines.append(
+            f"[{i}] scenario: {scenario} | {desc} | tables: {tables} | updated: {updated} | checks: {checks}"
+        )
     return "\n".join(lines)
+
+
+def _build_schema_index(cache: dict | None = None) -> tuple[dict[str, str], set[str]]:
+    """Return cached table -> database mapping and known database names."""
+    if cache is None:
+        cache = _load_schema_cache()
+
+    table_to_db: dict[str, str] = {}
+    databases: set[str] = set()
+    for key in cache:
+        if "." not in key:
+            continue
+        database, table = key.split(".", 1)
+        databases.add(database.lower())
+        table_to_db.setdefault(table.lower(), database)
+
+    return table_to_db, databases
+
+
+def _extract_db_check_tables(db_checks: list[str] | None, cache: dict | None = None) -> list[str]:
+    """Extract only explicit table names referenced in db_checks text.
+
+    db_checks are verification goals, not free-form schema discovery hints. We
+    only trust names that map exactly to known cached tables, including forms
+    like:
+    - ``orders``
+    - ``orders_total.value``  -> table ``orders_total``
+    - ``warehouse.orders``    -> table ``orders``
+    """
+    if not db_checks:
+        return []
+
+    table_to_db, databases = _build_schema_index(cache)
+    if not table_to_db:
+        return []
+
+    known_tables = set(table_to_db)
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _remember(table: str) -> None:
+        if table in known_tables and table not in seen:
+            seen.add(table)
+            found.append(table)
+
+    for check in db_checks:
+        lowered = check.lower()
+
+        # Dot-qualified references: db.table, table.column, db.table.column
+        for dotted in re.findall(r"([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)", lowered):
+            parts = dotted.split(".")
+            if len(parts) >= 2 and parts[0] in databases and parts[1] in known_tables:
+                _remember(parts[1])
+                continue
+            if parts[0] in known_tables:
+                _remember(parts[0])
+                continue
+            if len(parts) >= 3 and parts[1] in known_tables:
+                _remember(parts[1])
+
+        # Bare tokens: exact table names only, not substring keyword matches.
+        for token in re.findall(r"[a-z][a-z0-9_]*", lowered):
+            _remember(token)
+
+    return found
+
+
+def _prefer_same_scenario_memories(manifest: list[dict], scenario_name: str | None) -> list[dict]:
+    """Prefer memories from the same scenario to avoid cross-scenario drift."""
+    if not manifest or not scenario_name:
+        return manifest
+
+    target = scenario_name.lower()
+    exact = [m for m in manifest if str(m.get("scenario", "")).lower() == target]
+    return exact or manifest
 
 
 def _get_model_client():
@@ -397,7 +475,7 @@ CRITICAL: Do NOT hardcode specific values from this run (order IDs, amounts, pro
     file_path = mem_dir / f"{slug}_{ts_suffix}.md"
     try:
         file_path.write_text(content)
-        logger.info(f"[db] created memory {file_path.name} with {len(final_tables)} tables")
+        logger.info(f"[db] created memory {file_path.name} ({len(content)} chars)")
     except Exception as e:
         logger.warning(f"[db] failed to save verify memory: {e}")
 
@@ -569,9 +647,10 @@ def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str
     if not cache:
         return ""
 
-    # Build keyword set from all available context (including db_checks)
-    checks_text = " ".join(db_checks) if db_checks else ""
-    context = f"{data_json} {workflow_summary} {network_log} {checks_text}".lower()
+    # Build keyword set from runtime evidence only. db_checks are handled
+    # separately as explicit table names so natural-language phrasing does not
+    # fan out into unrelated schema matches.
+    context = f"{data_json} {workflow_summary} {network_log}".lower()
 
     # Extract meaningful words (skip very short/common ones)
     words = set(re.findall(r"[a-z_]{3,}", context))
@@ -587,11 +666,14 @@ def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str
     # Always include common business tables
     keywords.update({"order", "orders", "customer", "customers", "payment", "product"})
 
-    # Match tables whose name contains any keyword
+    explicit_tables = set(_extract_db_check_tables(db_checks, cache))
+
+    # Match tables whose name contains any keyword, always keeping explicit
+    # tables named in db_checks even when the rest of the context is sparse.
     matched: dict[str, str] = {}
     for db_table, schema in cache.items():
         table_name = db_table.split(".")[-1].lower()
-        if any(kw in table_name for kw in keywords):
+        if table_name in explicit_tables or any(kw in table_name for kw in keywords):
             matched[db_table] = schema
 
     if not matched:
@@ -603,6 +685,7 @@ def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str
         scored = sorted(
             matched.items(),
             key=lambda kv: (
+                0 if kv[0].split(".")[-1].lower() in explicit_tables else 1,
                 0 if kv[0].split(".")[-1].lower() in remembered else 1,
                 len(kv[0].split(".")[-1]),
             ),
@@ -615,7 +698,12 @@ def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str
         lines.append(columns)
 
     result = "\n".join(lines)
-    logger.info(f"[db] schema hint: {len(matched)} tables matched from {len(cache)} cached")
+    logger.info(
+        "[db] schema hint: %s tables matched from %s cached (explicit db_checks tables: %s)",
+        len(matched),
+        len(cache),
+        sorted(explicit_tables),
+    )
     return result
 
 
@@ -729,32 +817,20 @@ async def _describe_db_checks_tables() -> str:
     if not _db_checks or not _db_mcp_servers:
         return ""
 
-    # Extract table names from db_checks text (e.g. "orders_total 表中..." → "orders_total")
-    # No \b word boundary — Chinese text adjacent to English breaks \b matching
-    table_names: set[str] = set()
-    for check in _db_checks:
-        for match in re.findall(r"([a-z][a-z0-9]*(?:_[a-z0-9]+)+)", check.lower()):
-            table_names.add(match)
-
-    if not table_names:
-        return ""
-
-    # Detect database name from cache path (e.g. "inkstation.orders" → "inkstation")
     cache = _load_schema_cache()
-    database = ""
-    if cache:
-        first_key = next(iter(cache))
-        if "." in first_key:
-            database = first_key.split(".")[0]
-
-    if not database:
+    table_to_db, _ = _build_schema_index(cache)
+    table_names = _extract_db_check_tables(_db_checks, cache)
+    if not table_names or not table_to_db:
         return ""
 
     server = _db_mcp_servers[0]
     lines = ["## Live Schema (from db_checks — fresh describe_table, not cache)"]
     described = 0
 
-    for table in sorted(table_names):
+    for table in table_names:
+        database = table_to_db.get(table)
+        if not database:
+            continue
         try:
             result = await server.call_tool("describe_table", {"database": database, "table": table})
             raw = _serialize_tool_result(getattr(result, "content", result))
@@ -815,6 +891,7 @@ async def verify_in_db(data_json: str) -> str:
     picked_paths: list[Path] = []
     manifest = _scan_memory_manifest()
     if manifest:
+        manifest = _prefer_same_scenario_memories(manifest, _scenario_name)
         context = f"UI Data: {data_json}\nWorkflow: {workflow_summary[:500]}\nNetwork: {network_log[:500]}"
         if _db_checks:
             context += f"\nDB Checks: {', '.join(_db_checks)}"

@@ -69,7 +69,7 @@ class ScenarioReport(BaseModel):
     )
     overall_status: StepStatus = StepStatus.PASS  # pass only if ALL steps + verifications pass
     steps_executed: list[ScenarioStep] = Field(default_factory=list)
-    extracted_data: dict[str, str | int | bool | None] = Field(
+    extracted_data: dict[str, str | int | float | bool | None] = Field(
         default_factory=dict,
         description=(
             "Key business values visible on the UI at completion: order IDs, amounts, "
