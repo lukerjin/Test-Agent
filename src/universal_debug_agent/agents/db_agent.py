@@ -23,13 +23,13 @@ _DB_PROMPT_FOCUSED = """You are a database verification agent.
 
 - **Verification Checklist**: Exact checks to perform (from scenario config)
 - **Live Schema**: Target table definitions with column names and types
-- **Network Log**: Mutation requests (POST/PUT/PATCH/DELETE) with request bodies captured during UI test
+- **Network Log**: Mutation requests (POST/PUT/PATCH/DELETE) with request and response bodies captured during UI test
 - **UI Data** (user message): Business values visible on the page
 
 ## Steps
 
 1. Read the checklist — each item tells you what table and condition to verify.
-2. Extract precise values from the network log request bodies (e.g. order_ref, payment_method_id) to use as WHERE conditions.
+2. Extract precise values from the network log request/response bodies (e.g. order_ref, payment_method_id, server-returned IDs) to use as WHERE conditions.
 3. If a column stores coded values (e.g. status=1), use `grep_code` to find the enum/constant definition in the codebase.
 4. Write SELECT queries using the EXACT column names from live schema.
 5. Execute queries. If a query errors, fix it and retry — do NOT give up.

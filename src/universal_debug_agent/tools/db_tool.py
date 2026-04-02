@@ -358,7 +358,7 @@ async def _fetch_network_log() -> str:
     try:
         result = await _playwright_server.call_tool(
             "browser_network_requests",
-            {"requestBody": True, "requestHeaders": False, "static": False},
+            {"requestBody": True, "responseBody": True, "requestHeaders": False, "static": False},
         )
     except Exception as e:
         logger.warning(f"[db] failed to fetch network log: {e}")
@@ -400,8 +400,8 @@ async def _fetch_network_log() -> str:
             url_counts[line_stripped] = url_counts.get(line_stripped, 0) + 1
             mutations.append(line_stripped)
             last_was_mutation = True
-        # Keep "Request body:" lines that follow a kept mutation request
-        elif line_stripped.startswith("Request body:") and last_was_mutation:
+        # Keep "Request body:" and "Response body:" lines that follow a kept mutation request
+        elif (line_stripped.startswith("Request body:") or line_stripped.startswith("Response body:")) and last_was_mutation:
             mutations.append("  " + line_stripped)
         else:
             last_was_mutation = False
