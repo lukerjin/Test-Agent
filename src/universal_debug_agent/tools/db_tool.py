@@ -56,6 +56,7 @@ _evidence_collector: Any = None  # EvidenceCollector instance
 _code_root_dir: str = ""
 _usage_tracker: Any = None  # LLMUsageTracker instance
 _db_checks: list[str] = []  # Scenario-specific verification hints
+_scenario_name: str | None = None  # For DB verify memory
 
 
 def configure(
@@ -69,9 +70,10 @@ def configure(
     code_root_dir: str = "",
     usage_tracker: Any = None,
     db_checks: list[str] | None = None,
+    scenario_name: str | None = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir, _usage_tracker, _db_checks
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir, _usage_tracker, _db_checks, _scenario_name
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
@@ -82,6 +84,322 @@ def configure(
     _code_root_dir = code_root_dir
     _usage_tracker = usage_tracker
     _db_checks = db_checks or []
+    _scenario_name = scenario_name
+
+
+def _db_verify_memory_dir() -> Path | None:
+    """Return the project-specific directory for DB verify memory files."""
+    if _cache_path is None:
+        return None
+    # Use schema cache filename to derive project slug: db_schema_Inkstation_Agent_Testing.json → Inkstation_Agent_Testing
+    project_slug = _cache_path.stem.replace("db_schema_", "")
+    return _cache_path.parent / "db_verify" / project_slug
+
+
+def _parse_memory_frontmatter(path: Path) -> dict | None:
+    """Read frontmatter from a .md memory file. Returns parsed dict or None."""
+    try:
+        text = path.read_text()
+    except Exception:
+        return None
+    if not text.startswith("---"):
+        return None
+    end = text.find("---", 3)
+    if end == -1:
+        return None
+    try:
+        import yaml
+        fm = yaml.safe_load(text[3:end])
+        if isinstance(fm, dict):
+            fm["_path"] = path
+            return fm
+    except Exception:
+        pass
+    return None
+
+
+def _scan_memory_manifest() -> list[dict]:
+    """Scan memory files, read only frontmatter, return manifest sorted by updated desc.
+
+    Returns list of dicts with keys: _path, type, description, tables, updated, checks.
+    Cap at 200 files, newest first.
+    """
+    mem_dir = _db_verify_memory_dir()
+    if mem_dir is None or not mem_dir.exists():
+        return []
+
+    memories: list[dict] = []
+    for path in mem_dir.glob("*.md"):
+        fm = _parse_memory_frontmatter(path)
+        if fm:
+            memories.append(fm)
+
+    memories.sort(key=lambda m: m.get("updated", ""), reverse=True)
+    return memories[:200]
+
+
+def _build_manifest_text(manifest: list[dict]) -> str:
+    """Build a lightweight text representation of the manifest for LLM consumption."""
+    lines = []
+    for i, m in enumerate(manifest):
+        desc = m.get("description", "no description")
+        raw_tables = m.get("tables", [])
+        tables = ", ".join(raw_tables) if isinstance(raw_tables, list) else str(raw_tables)
+        updated = m.get("updated", "?")
+        checks = m.get("checks", 0)
+        lines.append(f"[{i}] {desc} | tables: {tables} | updated: {updated} | checks: {checks}")
+    return "\n".join(lines)
+
+
+def _get_model_client():
+    """Extract AsyncOpenAI client and model name from the configured _model.
+
+    Works with both native OpenAI (str) and OpenAIChatCompletionsModel instances,
+    so memory LLM calls use the same provider/credentials as the main agent.
+    """
+    from openai import AsyncOpenAI
+
+    if _model is None:
+        return None, None
+
+    # Native OpenAI: _model is a string like "gpt-4o"
+    if isinstance(_model, str):
+        import httpx
+        return AsyncOpenAI(timeout=httpx.Timeout(30.0, connect=5.0)), _model
+
+    # OpenAIChatCompletionsModel: stores client as ._client, model name as .model
+    client = getattr(_model, "_client", None)
+    model_name = getattr(_model, "model", None)
+    if client and model_name:
+        return client, model_name
+
+    return None, None
+
+
+async def _llm_select_memories(manifest: list[dict], context: str, top_n: int = 5) -> list[int]:
+    """Use LLM to pick most relevant memory indices from a manifest.
+
+    Returns list of selected indices.
+    """
+    if not manifest or _model is None:
+        return []
+
+    client, model_name = _get_model_client()
+    if not client or not model_name:
+        return []
+
+    manifest_text = _build_manifest_text(manifest)
+
+    prompt = (
+        "You are selecting relevant DB verification memories for a test scenario.\n\n"
+        f"## Current context\n{context[:2000]}\n\n"
+        f"## Available memories\n{manifest_text}\n\n"
+        f"Pick up to {top_n} memories most relevant to the current context. "
+        "Return ONLY the index numbers, comma-separated. Example: 0,2,4\n"
+        "If none are relevant, return: none"
+    )
+
+    try:
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=50,
+            temperature=0,
+        )
+        answer = response.choices[0].message.content.strip()
+        logger.info(f"[db] memory LLM selection (top {top_n}): {answer}")
+
+        if answer.lower() == "none":
+            return []
+
+        indices = []
+        for part in answer.replace(" ", "").split(","):
+            try:
+                idx = int(part)
+                if 0 <= idx < len(manifest):
+                    indices.append(idx)
+            except ValueError:
+                continue
+        return indices[:top_n]
+    except Exception as e:
+        logger.warning(f"[db] memory LLM selection failed: {e}")
+        return []
+
+
+def _load_memory_content(paths: list[Path], max_total_chars: int = 6000) -> tuple[list[str], str]:
+    """Load selected memory files. Returns (table_names, full_content_for_prompt).
+
+    table_names: used to prioritize schema hint filtering.
+    full_content: injected into DB agent prompt as verification knowledge.
+    """
+    tables: set[str] = set()
+    content_parts: list[str] = []
+    total_chars = 0
+
+    for path in paths:
+        fm = _parse_memory_frontmatter(path)
+        if fm and isinstance(fm.get("tables"), list):
+            tables.update(t.lower() for t in fm["tables"] if isinstance(t, str))
+
+        # Load full file content for prompt injection
+        try:
+            text = path.read_text()
+            # Strip frontmatter, keep body
+            if text.startswith("---"):
+                end = text.find("---", 3)
+                if end != -1:
+                    text = text[end + 3:].strip()
+            if text and total_chars + len(text) <= max_total_chars:
+                content_parts.append(f"### From: {path.stem}\n\n{text}")
+                total_chars += len(text)
+        except Exception:
+            pass
+
+    content = ""
+    if content_parts:
+        content = "## DB Verification Memory (from previous successful runs)\n\n" + "\n\n---\n\n".join(content_parts)
+
+    logger.info(f"[db] loaded {len(tables)} tables, {len(content_parts)} memory docs ({total_chars} chars)")
+    return sorted(tables), content
+
+
+async def _save_db_verify_memory(verifications: list[dict]) -> None:
+    """Use LLM to generate rich verification memory from successful results.
+
+    Always creates a new file. Old memories accumulate and are selected by
+    relevance during load — no risk of overwriting unrelated memories.
+    """
+    mem_dir = _db_verify_memory_dir()
+    if mem_dir is None:
+        return
+
+    # Only save when ALL checks passed
+    has_query = [v for v in verifications if v.get("query")]
+    if not has_query:
+        logger.info("[db] memory save: no checks with queries, skipping")
+        return
+    all_pass = all(v.get("status") == "pass" for v in has_query)
+    if not all_pass:
+        statuses = [v.get("status") for v in has_query]
+        logger.info(f"[db] memory save: not all pass ({statuses}), skipping")
+        return
+
+    client, model_name = _get_model_client()
+    logger.info(f"[db] memory save: all_pass=True, client={'yes' if client else 'None'}, model={model_name}")
+
+    # Build verification summary for LLM
+    checks_text = ""
+    for v in verifications:
+        checks_text += f"- {v.get('check_name', '?')}\n"
+        checks_text += f"  SQL: {v.get('query', '')}\n"
+        checks_text += f"  Expected: {v.get('expected', '')}\n"
+        checks_text += f"  Actual: {v.get('actual', '')}\n\n"
+
+    scenario_label = _scenario_name or "unknown"
+
+    prompt = f"""You are generating a DB verification memory document from successful test results.
+
+## Scenario: {scenario_label}
+
+## Successful verification checks
+
+{checks_text}
+
+## Instructions
+
+Generate a markdown document starting with a YAML frontmatter block. The frontmatter MUST follow this exact format:
+
+```
+---
+name: <short name, e.g. "Checkout DB verification mapping">
+description: <one line under 120 chars, specific to business domain, e.g. "Stable table and column mapping for checkout order verification in legacy ecommerce flow">
+type: project
+scenario: {scenario_label}
+domain: db_verification
+status: active
+tables: <comma-separated list of table names used, e.g. [orders, orders_products, orders_total]>
+confidence: high
+tags: <YAML list of relevant keywords for retrieval, include scenario name, table names, and business terms>
+---
+```
+
+After the frontmatter, include these body sections:
+
+## Summary
+One sentence: which tables are used and for what.
+
+## Primary tables
+For each table used in the queries above:
+- table name
+- role (e.g. "main order record", "order line items")
+- key columns (only the ones actually used in the queries)
+
+## Common joins
+List the JOIN conditions from the successful queries.
+
+## Verification flow
+Numbered steps: how to verify this scenario (derived from the actual queries).
+IMPORTANT: Use generic placeholders (e.g. `<orders_ref>`, `<product_id>`, `<expected_total>`) instead of hardcoded values from this specific run. The flow should be reusable for any checkout, not just this one.
+
+## Common pitfalls
+List any column name gotchas (e.g. "use products_quantity not products_qty").
+Only include pitfalls you can infer from the actual SQL — do not invent.
+
+## Table ranking hint
+Prioritize these tables during schema filtering (ordered by importance).
+
+## When to reuse
+Bullet list of scenario keywords where this memory applies.
+
+## Freshness note
+Always end with: "Treat this memory as guidance, not source of truth. If schema inspection or current code disagrees, trust current schema/code first."
+
+Keep it concise. Only include facts supported by the queries above.
+CRITICAL: Do NOT hardcode specific values from this run (order IDs, amounts, product IDs, emails). Use generic placeholders like `<orders_ref>`, `<total>`, `<product_id>`. This memory must be reusable across different runs of the same scenario."""
+
+    if not client or not model_name:
+        logger.warning("[db] no model client available, skipping memory generation")
+        return
+
+    try:
+        response = await client.chat.completions.create(
+            model=model_name,
+            messages=[{"role": "user", "content": prompt}],
+            max_completion_tokens=1000,
+            temperature=0.2,
+        )
+        body = response.choices[0].message.content.strip()
+        logger.info(f"[db] LLM generated memory body ({len(body)} chars)")
+    except Exception as e:
+        logger.error(f"[db] memory LLM generation failed: {type(e).__name__}: {e}")
+        return
+
+    from datetime import datetime
+    now = datetime.now().isoformat(timespec="seconds")
+
+    # LLM generates full frontmatter + body. Inject `updated` timestamp.
+    # Find the closing --- of frontmatter and insert updated field before it.
+    if body.startswith("---"):
+        end = body.find("---", 3)
+        if end != -1:
+            content = body[:end] + f"updated: {now}\n" + body[end:]
+        else:
+            content = body
+    else:
+        # LLM didn't generate frontmatter — wrap it
+        content = f"---\nname: {scenario_label} DB verification mapping\nupdated: {now}\n---\n\n{body}"
+
+    # Always create a new file — old memories accumulate, selected by relevance at load time
+    mem_dir.mkdir(parents=True, exist_ok=True)
+    slug = _scenario_name or now.replace(":", "-")
+    # Add timestamp suffix to avoid overwriting previous memory for same scenario
+    ts_suffix = now.replace(":", "").replace("-", "")[:15]
+    file_path = mem_dir / f"{slug}_{ts_suffix}.md"
+    try:
+        file_path.write_text(content)
+        logger.info(f"[db] created memory {file_path.name} with {len(final_tables)} tables")
+    except Exception as e:
+        logger.warning(f"[db] failed to save verify memory: {e}")
 
 
 def _load_schema_cache() -> dict:
@@ -240,7 +558,7 @@ def _build_workflow_summary() -> str:
     return "\n".join(lines)
 
 
-def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str) -> str:
+def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str, remembered_tables: list[str] | None = None, db_checks: list[str] | None = None) -> str:
     """Filter schema cache to tables matching keywords from the context.
 
     Extracts keywords from UI data, workflow summary, and network log,
@@ -251,8 +569,9 @@ def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str
     if not cache:
         return ""
 
-    # Build keyword set from all available context
-    context = f"{data_json} {workflow_summary} {network_log}".lower()
+    # Build keyword set from all available context (including db_checks)
+    checks_text = " ".join(db_checks) if db_checks else ""
+    context = f"{data_json} {workflow_summary} {network_log} {checks_text}".lower()
 
     # Extract meaningful words (skip very short/common ones)
     words = set(re.findall(r"[a-z_]{3,}", context))
@@ -280,11 +599,13 @@ def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str
 
     # Cap at ~20 tables to keep token budget reasonable
     if len(matched) > 20:
-        # Shorter table names are more likely core business tables
-        # (e.g. "customers" > "customers_basket_attributes")
+        remembered = set(remembered_tables or [])
         scored = sorted(
             matched.items(),
-            key=lambda kv: len(kv[0].split(".")[-1]),
+            key=lambda kv: (
+                0 if kv[0].split(".")[-1].lower() in remembered else 1,
+                len(kv[0].split(".")[-1]),
+            ),
         )
         matched = dict(scored[:20])
 
@@ -399,6 +720,63 @@ class _DBHooks(RunHooks):
                 logger.debug(f"[db] could not cache schema: {e}")
 
 
+async def _describe_db_checks_tables() -> str:
+    """Extract table names from db_checks, call describe_table via MCP for each.
+
+    Returns a schema section with fresh column definitions for tables
+    explicitly mentioned in db_checks. Bypasses cache — always live.
+    """
+    if not _db_checks or not _db_mcp_servers:
+        return ""
+
+    # Extract table names from db_checks text (e.g. "orders_total 表中..." → "orders_total")
+    # No \b word boundary — Chinese text adjacent to English breaks \b matching
+    table_names: set[str] = set()
+    for check in _db_checks:
+        for match in re.findall(r"([a-z][a-z0-9]*(?:_[a-z0-9]+)+)", check.lower()):
+            table_names.add(match)
+
+    if not table_names:
+        return ""
+
+    # Detect database name from cache path (e.g. "inkstation.orders" → "inkstation")
+    cache = _load_schema_cache()
+    database = ""
+    if cache:
+        first_key = next(iter(cache))
+        if "." in first_key:
+            database = first_key.split(".")[0]
+
+    if not database:
+        return ""
+
+    server = _db_mcp_servers[0]
+    lines = ["## Live Schema (from db_checks — fresh describe_table, not cache)"]
+    described = 0
+
+    for table in sorted(table_names):
+        try:
+            result = await server.call_tool("describe_table", {"database": database, "table": table})
+            raw = _serialize_tool_result(getattr(result, "content", result))
+            if raw and "Error" not in raw:
+                parsed = _parse_describe_result(raw)
+                lines.append(f"\n### {database}.{table}")
+                lines.append(parsed)
+                described += 1
+                logger.info(f"[db] live describe_table: {database}.{table}")
+            else:
+                logger.warning(f"[db] describe_table failed for {table}: {raw[:100]}")
+        except Exception as e:
+            logger.warning(f"[db] describe_table error for {table}: {e}")
+
+    if described == 0:
+        return ""
+
+    result_str = "\n".join(lines)
+    logger.info(f"[db] described {described}/{len(table_names)} tables from db_checks")
+    return result_str
+
+
 @function_tool
 async def verify_in_db(data_json: str) -> str:
     """Verify business data in the database using key values extracted from the UI.
@@ -429,7 +807,27 @@ async def verify_in_db(data_json: str) -> str:
 
     network_log = await _fetch_network_log()
     workflow_summary = _build_workflow_summary()
-    schema_hint = _filter_schema_cache(data_json, workflow_summary, network_log)
+
+    # Memory: scan manifests → LLM picks top 5 → load tables + content
+    # picked_paths reused at save time as merge target (no second LLM call)
+    remembered_tables: list[str] = []
+    memory_content: str = ""
+    picked_paths: list[Path] = []
+    manifest = _scan_memory_manifest()
+    if manifest:
+        context = f"UI Data: {data_json}\nWorkflow: {workflow_summary[:500]}\nNetwork: {network_log[:500]}"
+        if _db_checks:
+            context += f"\nDB Checks: {', '.join(_db_checks)}"
+        selected = await _llm_select_memories(manifest, context, top_n=5)
+        if selected:
+            picked_paths = [manifest[i]["_path"] for i in selected]
+            remembered_tables, memory_content = _load_memory_content(picked_paths)
+
+    schema_hint = _filter_schema_cache(data_json, workflow_summary, network_log, remembered_tables, _db_checks)
+
+    # For tables explicitly mentioned in db_checks, get fresh schema via describe_table (bypasses cache)
+    live_schema = await _describe_db_checks_tables()
+
     db_agent = create_db_agent(
         mcp_servers=_db_mcp_servers,
         model=_model,
@@ -437,7 +835,9 @@ async def verify_in_db(data_json: str) -> str:
         workflow_summary=workflow_summary,
         code_root_dir=_code_root_dir,
         schema_hint=schema_hint,
+        live_schema=live_schema,
         db_checks=_db_checks,
+        verify_memory=memory_content,
     )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
     if network_log:
@@ -446,6 +846,8 @@ async def verify_in_db(data_json: str) -> str:
         logger.info(f"[db] injecting workflow summary ({len(workflow_summary)} chars)")
     if schema_hint:
         logger.info(f"[db] injecting schema hint ({len(schema_hint)} chars)")
+    if live_schema:
+        logger.info(f"[db] injecting live schema for db_checks tables ({len(live_schema)} chars)")
     if _db_checks:
         logger.info(f"[db] injecting {len(_db_checks)} verification hints from scenario")
 
@@ -457,7 +859,9 @@ async def verify_in_db(data_json: str) -> str:
             f"## UI Data\n{data_json}\n\n"
             f"## Workflow Summary\n{workflow_summary or '(none)'}\n\n"
             f"## Network Log\n{network_log or '(none)'}\n\n"
-            f"## Schema Hint\n{schema_hint or '(none)'}",
+            f"## Live Schema\n{live_schema or '(none)'}\n\n"
+            f"## Schema Hint\n{schema_hint or '(none)'}\n\n"
+            f"## Memory\n{memory_content or '(none)'}",
         )
 
     try:
@@ -471,11 +875,21 @@ async def verify_in_db(data_json: str) -> str:
         if _usage_tracker is not None:
             _usage_tracker.record_run_result(result, phase="db_verify")
         output = result.final_output
+        # Normalize to list[dict] regardless of output type
         if isinstance(output, DBVerificationOutput):
-            return json.dumps([v.model_dump() for v in output.verifications], default=str)
-        if isinstance(output, str):
-            return output
-        return json.dumps(output)
+            verifications = [v.model_dump() for v in output.verifications]
+        elif isinstance(output, str):
+            try:
+                parsed = json.loads(output)
+                verifications = parsed if isinstance(parsed, list) else None
+            except Exception:
+                verifications = None
+            if verifications is None:
+                return output
+        else:
+            return json.dumps(output)
+        await _save_db_verify_memory(verifications)
+        return json.dumps(verifications, default=str)
     except Exception as e:
         logger.error(f"[db] DB agent error: {e}")
         return json.dumps([{
