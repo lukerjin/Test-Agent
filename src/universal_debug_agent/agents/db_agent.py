@@ -173,7 +173,7 @@ def create_db_agent(
     if network_log:
         instructions += f"\n## Network Log (API calls captured during UI test)\n\n```\n{network_log}\n```\n"
 
-    tools = [grep_code] if code_root_dir else []
+    tools = [grep_code, read_file] if code_root_dir else []
 
     return Agent(
         name="DBVerifier",
