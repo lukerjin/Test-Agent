@@ -170,6 +170,7 @@ class InvestigationOrchestrator:
         usage_tracker: LLMUsageTracker | None = None,
         trace_recorder: ExecutionTraceRecorder | None = None,
         db_checks: list[str] | None = None,
+        scenario_name: str | None = None,
     ):
         self.profile = profile
         self.mcp_servers = mcp_servers
@@ -222,6 +223,7 @@ class InvestigationOrchestrator:
             code_root_dir=profile.code.root_dir,
             usage_tracker=usage_tracker,
             db_checks=db_checks,
+            scenario_name=scenario_name,
         )
 
     @staticmethod

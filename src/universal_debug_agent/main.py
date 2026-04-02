@@ -134,6 +134,7 @@ async def _run_test(
     max_steps: int | None,
     verbose: bool,
     db_checks: list[str] | None = None,
+    scenario_name: str | None = None,
 ) -> None:
     # Setup logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -211,6 +212,7 @@ async def _run_test(
         usage_tracker=usage_tracker,
         trace_recorder=trace_recorder,
         db_checks=db_checks,
+        scenario_name=scenario_name,
     )
 
     try:
@@ -326,9 +328,11 @@ def test(
 
     # Resolve named scenario from profile
     db_checks: list[str] | None = None
+    scenario_name: str | None = None
     try:
         _profile = load_profile(profile)
         if scenario and scenario in _profile.scenarios:
+            scenario_name = scenario
             cfg = _profile.scenarios[scenario]
             if isinstance(cfg, ScenarioConfig):
                 scenario = cfg.description
@@ -363,6 +367,7 @@ def test(
             max_steps=max_steps,
             verbose=verbose,
             db_checks=db_checks,
+            scenario_name=scenario_name,
         ))
     except (RateLimitError, APIStatusError) as e:
         provider = "LLM"
