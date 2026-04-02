@@ -288,6 +288,38 @@ scenarios:
 
 同时，`MCPToolOutputFilter` 的 same-page boundary 逻辑确保**同一页面 URL 下的 snapshot 不会被历史轮截断**（如 fill_form 等无 URL 的操作被视为同一页面）。
 
+## DB Verify Memory
+
+DB agent 每次全 pass 后，LLM 自动生成一份结构化的 `.md` 验证知识文档，存储在 `memory/db_verify/{project}/` 下。下次运行时，系统扫描这些文件的 frontmatter，让 LLM 选出最相关的注入 DB agent prompt。
+
+**Memory 文件内容（全部由 LLM 生成）：**
+- Frontmatter: `name`、`description`、`tags`、`tables`、`confidence`
+- Body: Primary tables（角色 + 关键列）、Common joins、Verification flow（通用占位符，不硬编码值）、Common pitfalls（列名陷阱等）、Table ranking hint、When to reuse
+
+**工作流程：**
+
+```
+第一次跑 checkout（无 memory）:
+  DB agent 自行探索 → 全 pass
+  → LLM 生成 memory .md 文件（表关系、joins、pitfalls）
+  → 保存到 memory/db_verify/Inkstation_Agent_Testing/checkout_20260402T130646.md
+
+第二次跑 checkout（有 memory）:
+  扫描 memory frontmatter → LLM 选最相关的 → 注入 DB agent prompt
+  → DB agent 看到 "use products_quantity not products_qty"
+  → 直接写对 SQL，零 retry
+```
+
+**Live Schema（db_checks 专用）：**
+
+`db_checks` 里提到的表会在运行时通过 MCP `describe_table` 实时获取最新列定义，不依赖本地 cache。确保即使表结构更新了，DB agent 也能看到正确的列名。
+
+```
+memory/db_verify/
+└── Inkstation_Agent_Testing/          ← 按项目隔离
+    └── checkout_20260402T130646.md    ← LLM 生成的验证知识
+```
+
 ---
 
 ## CLI 参考
