@@ -56,6 +56,17 @@ _code_root_dir: str = ""
 _usage_tracker: Any = None  # LLMUsageTracker instance
 _db_checks: list[str] = []  # Scenario-specific verification hints
 _scenario_name: str | None = None  # For DB verify memory
+_captured_form_data: list[dict] = []  # Form data captured by hooks before traditional form submits
+
+
+def record_form_capture(data: dict) -> None:
+    """Called by hooks when a form submission is detected before browser_click."""
+    _captured_form_data.append(data)
+
+
+def clear_captured_form_data() -> None:
+    """Reset captured form data at scenario start."""
+    _captured_form_data.clear()
 
 
 def configure(
@@ -406,7 +417,7 @@ async def _fetch_network_log() -> str:
         else:
             last_was_mutation = False
 
-    if not mutations:
+    if not mutations and not _captured_form_data:
         return ""
 
     # Auto-blacklist high-frequency URLs (likely polling, not user actions)
@@ -425,10 +436,14 @@ async def _fetch_network_log() -> str:
         mutations = filtered
         logger.info(f"[db] filtered {len(polling_urls)} high-frequency polling URLs from network log")
 
-    if not mutations:
+    if not mutations and not _captured_form_data:
         return ""
 
-    result_str = "\n".join(mutations)
+    result_str = "\n".join(mutations) if mutations else ""
+
+    # Merge captured form data (traditional form POSTs missed by network capture)
+    result_str = _merge_form_captures(result_str, mutations)
+
     # Truncate from HEAD to keep tail (final submit is usually most important)
     if len(result_str) > 3000:
         result_str = "... (earlier mutations truncated)\n" + result_str[-3000:]
@@ -436,6 +451,62 @@ async def _fetch_network_log() -> str:
     return result_str
 
 
+def _merge_form_captures(result_str: str, mutations: list[str]) -> str:
+    """Append captured form data to the network log.
+
+    Traditional form POSTs cause page navigation and are missed by
+    browser_network_requests. Form data captured by hooks before click
+    is merged here, with deduplication against existing XHR mutations.
+    """
+    if not _captured_form_data:
+        return result_str
+
+    # Collect URLs already present in XHR mutations for dedup
+    existing_urls = set()
+    for m in mutations:
+        # Lines like "[POST] http://example.com/path => [200] OK"
+        if m.startswith("["):
+            parts = m.split(" ", 2)
+            if len(parts) >= 2:
+                existing_urls.add(parts[1])
+
+    form_lines: list[str] = []
+    for form in _captured_form_data:
+        action = form.get("action", "?")
+        method = form.get("method", "POST")
+        fields = form.get("fields", {})
+
+        # Domain filter
+        if _allowed_domains and not any(d in action for d in _allowed_domains):
+            continue
+        # Dedup: skip if this URL already appears in XHR mutations
+        if action in existing_urls:
+            continue
+
+        # Format body
+        if fields:
+            body_parts = []
+            for k, v in fields.items():
+                if isinstance(v, list):
+                    for item in v:
+                        body_parts.append(f"{k}={item}")
+                else:
+                    body_parts.append(f"{k}={v}")
+            body_str = "&".join(body_parts)
+        else:
+            body_str = "(empty)"
+
+        form_lines.append(f"[{method}] {action} => [form submit]")
+        form_lines.append(f"  Request body: {body_str}")
+
+    if not form_lines:
+        return result_str
+
+    form_section = "\n".join(form_lines)
+    logger.info(f"[db] appended {len(form_lines) // 2} form capture(s) to network log")
+    if result_str:
+        return result_str + "\n" + form_section
+    return form_section
 
 
 def _parse_describe_result(result_str: str) -> str:

@@ -11,6 +11,7 @@ from typing import Any
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 from agents.exceptions import UserError
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
+from universal_debug_agent.tools import db_tool
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,7 @@ class InvestigationHooks(RunHooks):
 
         self._apply_playwright_defaults(context, tool_name)
         self._validate_playwright_click_args(context, tool_name)
+        await self._capture_form_data_before_click(context, tool_name)
 
         # Prefer buffered args from LLM response (reliable for MCP tools)
         buffered = self._pending_tool_args.get(tool_name)
@@ -225,6 +227,96 @@ class InvestigationHooks(RunHooks):
             logger.warning(f"[auto-snapshot] no yaml content in snapshot result after {tool_name}")
         except Exception as e:
             logger.warning(f"[auto-snapshot] failed after {tool_name}: {e}")
+
+    # JS function to extract form data before submit.
+    # Returns null if element is not inside a <form> or form is GET.
+    _FORM_CAPTURE_JS = """(element) => {
+  const form = element.closest('form');
+  if (!form) return null;
+  const method = (form.method || 'GET').toUpperCase();
+  if (method !== 'POST' && method !== 'PUT' && method !== 'PATCH' && method !== 'DELETE') return null;
+  const action = form.action || window.location.href;
+  const data = {};
+  const formData = new FormData(form);
+  for (const [key, value] of formData.entries()) {
+    if (value instanceof File) {
+      data[key] = '[File: ' + value.name + ', ' + value.size + ' bytes]';
+    } else if (data.hasOwnProperty(key)) {
+      if (Array.isArray(data[key])) data[key].push(value);
+      else data[key] = [data[key], value];
+    } else {
+      data[key] = value;
+    }
+  }
+  return { action: action, method: method, fields: data };
+}"""
+
+    async def _capture_form_data_before_click(
+        self, context: RunContextWrapper, tool_name: str
+    ) -> None:
+        """Capture form field values before browser_click submits a traditional form.
+
+        Traditional <form> POSTs cause page navigation and are invisible to
+        browser_network_requests. We use browser_evaluate to extract FormData
+        before the click, then pass it to db_tool for network log merging.
+        """
+        if tool_name != "browser_click" or self._playwright_server is None:
+            return
+
+        args = self._parse_tool_args(context)
+        if args is None:
+            return
+        ref = args.get("ref")
+        if not ref:
+            return
+
+        try:
+            result = await self._playwright_server.call_tool(
+                "browser_evaluate",
+                {"function": self._FORM_CAPTURE_JS, "ref": ref},
+            )
+            content = getattr(result, "content", result)
+            text = None
+            if isinstance(content, list):
+                for item in content:
+                    text = getattr(item, "text", None) or (
+                        item.get("text") if isinstance(item, dict) else None
+                    )
+                    if text:
+                        break
+            elif isinstance(content, str):
+                text = content
+
+            if not text or text.strip() == "null" or text.strip() == "undefined":
+                return
+
+            # browser_evaluate returns: "### Result\n{json}\n### Ran Playwright code\n```js...```"
+            # Extract the JSON between "### Result" and the next "###" or code block
+            if "### Result" in text:
+                start = text.index("### Result") + len("### Result")
+                # Find the end: next "###" heading or end of string
+                end = text.find("###", start)
+                if end == -1:
+                    end = len(text)
+                text = text[start:end].strip()
+
+            data = json.loads(text)
+            if not isinstance(data, dict) or "action" not in data:
+                return
+
+            db_tool.record_form_capture(data)
+            logger.info(
+                f"[form-capture] {data.get('method', 'POST')} {data.get('action', '?')} "
+                f"({len(data.get('fields', {}))} fields)"
+            )
+            if self.trace_recorder is not None:
+                self.trace_recorder.record(
+                    "form_capture",
+                    f"Form Capture: {data.get('method')} {data.get('action')}",
+                    f"Fields: {json.dumps(data.get('fields', {}), ensure_ascii=False)[:500]}",
+                )
+        except Exception as e:
+            logger.debug(f"[form-capture] failed for ref={ref}: {e}")
 
     def _tool_args(self, context: RunContextWrapper, tool: Tool) -> str:
         if hasattr(context, "tool_arguments"):
