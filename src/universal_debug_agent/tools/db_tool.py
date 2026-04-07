@@ -52,7 +52,6 @@ _trace_recorder: ExecutionTraceRecorder | None = None
 _cache_path: Path | None = None
 _playwright_server: MCPServerStdio | None = None
 _allowed_domains: list[str] = []
-_evidence_collector: Any = None  # EvidenceCollector instance
 _code_root_dir: str = ""
 _usage_tracker: Any = None  # LLMUsageTracker instance
 _db_checks: list[str] = []  # Scenario-specific verification hints
@@ -73,14 +72,13 @@ def configure(
     scenario_name: str | None = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _evidence_collector, _code_root_dir, _usage_tracker, _db_checks, _scenario_name
+    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _code_root_dir, _usage_tracker, _db_checks, _scenario_name
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
     _cache_path = cache_path
     _playwright_server = playwright_server
     _allowed_domains = allowed_domains or []
-    _evidence_collector = evidence_collector
     _code_root_dir = code_root_dir
     _usage_tracker = usage_tracker
     _db_checks = db_checks or []
@@ -95,63 +93,6 @@ def _db_verify_memory_dir() -> Path | None:
     project_slug = _cache_path.stem.replace("db_schema_", "")
     return _cache_path.parent / "db_verify" / project_slug
 
-
-def _parse_memory_frontmatter(path: Path) -> dict | None:
-    """Read frontmatter from a .md memory file. Returns parsed dict or None."""
-    try:
-        text = path.read_text()
-    except Exception:
-        return None
-    if not text.startswith("---"):
-        return None
-    end = text.find("---", 3)
-    if end == -1:
-        return None
-    try:
-        import yaml
-        fm = yaml.safe_load(text[3:end])
-        if isinstance(fm, dict):
-            fm["_path"] = path
-            return fm
-    except Exception:
-        pass
-    return None
-
-
-def _scan_memory_manifest() -> list[dict]:
-    """Scan memory files, read only frontmatter, return manifest sorted by updated desc.
-
-    Returns list of dicts with keys: _path, type, description, tables, updated, checks.
-    Cap at 200 files, newest first.
-    """
-    mem_dir = _db_verify_memory_dir()
-    if mem_dir is None or not mem_dir.exists():
-        return []
-
-    memories: list[dict] = []
-    for path in mem_dir.glob("*.md"):
-        fm = _parse_memory_frontmatter(path)
-        if fm:
-            memories.append(fm)
-
-    memories.sort(key=lambda m: m.get("updated", ""), reverse=True)
-    return memories[:200]
-
-
-def _build_manifest_text(manifest: list[dict]) -> str:
-    """Build a lightweight text representation of the manifest for LLM consumption."""
-    lines = []
-    for i, m in enumerate(manifest):
-        desc = m.get("description", "no description")
-        scenario = m.get("scenario", "unknown")
-        raw_tables = m.get("tables", [])
-        tables = ", ".join(raw_tables) if isinstance(raw_tables, list) else str(raw_tables)
-        updated = m.get("updated", "?")
-        checks = m.get("checks", 0)
-        lines.append(
-            f"[{i}] scenario: {scenario} | {desc} | tables: {tables} | updated: {updated} | checks: {checks}"
-        )
-    return "\n".join(lines)
 
 
 def _build_schema_index(cache: dict | None = None) -> tuple[dict[str, str], set[str]]:
@@ -219,15 +160,6 @@ def _extract_db_check_tables(db_checks: list[str] | None, cache: dict | None = N
     return found
 
 
-def _prefer_same_scenario_memories(manifest: list[dict], scenario_name: str | None) -> list[dict]:
-    """Prefer memories from the same scenario to avoid cross-scenario drift."""
-    if not manifest or not scenario_name:
-        return manifest
-
-    target = scenario_name.lower()
-    exact = [m for m in manifest if str(m.get("scenario", "")).lower() == target]
-    return exact or manifest
-
 
 def _get_model_client():
     """Extract AsyncOpenAI client and model name from the configured _model.
@@ -253,92 +185,6 @@ def _get_model_client():
 
     return None, None
 
-
-async def _llm_select_memories(manifest: list[dict], context: str, top_n: int = 5) -> list[int]:
-    """Use LLM to pick most relevant memory indices from a manifest.
-
-    Returns list of selected indices.
-    """
-    if not manifest or _model is None:
-        return []
-
-    client, model_name = _get_model_client()
-    if not client or not model_name:
-        return []
-
-    manifest_text = _build_manifest_text(manifest)
-
-    prompt = (
-        "You are selecting relevant DB verification memories for a test scenario.\n\n"
-        f"## Current context\n{context[:2000]}\n\n"
-        f"## Available memories\n{manifest_text}\n\n"
-        f"Pick up to {top_n} memories most relevant to the current context. "
-        "Return ONLY the index numbers, comma-separated. Example: 0,2,4\n"
-        "If none are relevant, return: none"
-    )
-
-    try:
-        response = await client.chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            max_completion_tokens=50,
-            temperature=0,
-        )
-        answer = response.choices[0].message.content.strip()
-        logger.info(f"[db] memory LLM selection (top {top_n}): {answer}")
-
-        if answer.lower() == "none":
-            return []
-
-        indices = []
-        for part in answer.replace(" ", "").split(","):
-            try:
-                idx = int(part)
-                if 0 <= idx < len(manifest):
-                    indices.append(idx)
-            except ValueError:
-                continue
-        return indices[:top_n]
-    except Exception as e:
-        logger.warning(f"[db] memory LLM selection failed: {e}")
-        return []
-
-
-def _load_memory_content(paths: list[Path], max_total_chars: int = 6000) -> tuple[list[str], str]:
-    """Load selected memory files. Returns (table_names, full_content_for_prompt).
-
-    table_names: used to prioritize schema hint filtering.
-    full_content: injected into DB agent prompt as verification knowledge.
-    """
-    tables: set[str] = set()
-    content_parts: list[str] = []
-    total_chars = 0
-
-    for path in paths:
-        fm = _parse_memory_frontmatter(path)
-        if fm and isinstance(fm.get("tables"), list):
-            tables.update(t.lower() for t in fm["tables"] if isinstance(t, str))
-
-        # Load full file content for prompt injection
-        try:
-            text = path.read_text()
-            # Strip frontmatter, keep body
-            if text.startswith("---"):
-                end = text.find("---", 3)
-                if end != -1:
-                    text = text[end + 3:].strip()
-            if text and total_chars + len(text) <= max_total_chars:
-                content_parts.append(f"### From: {path.stem}\n\n{text}")
-                total_chars += len(text)
-        except Exception:
-            pass
-
-    content = ""
-    if content_parts:
-        content = "## DB Verification Memory (from previous successful runs)\n\n" + "\n\n---\n\n".join(content_parts)
-
-    logger.info(f"[db] loaded {len(tables)} tables, {len(content_parts)} memory docs ({total_chars} chars)")
-    return sorted(tables), content
 
 
 async def _save_db_verify_memory(verifications: list[dict]) -> None:
@@ -512,7 +358,7 @@ async def _fetch_network_log() -> str:
     try:
         result = await _playwright_server.call_tool(
             "browser_network_requests",
-            {"requestBody": True, "requestHeaders": False, "static": False},
+            {"requestBody": True, "responseBody": True, "requestHeaders": False, "static": False},
         )
     except Exception as e:
         logger.warning(f"[db] failed to fetch network log: {e}")
@@ -536,6 +382,7 @@ async def _fetch_network_log() -> str:
 
     # Filter to mutation requests (POST/PUT/PATCH/DELETE), skip third-party noise
     mutations: list[str] = []
+    url_counts: dict[str, int] = {}
     last_was_mutation = False
     for line in raw.splitlines():
         line_stripped = line.strip()
@@ -549,10 +396,12 @@ async def _fetch_network_log() -> str:
             if _allowed_domains and not any(d in line_stripped for d in _allowed_domains):
                 last_was_mutation = False
                 continue
+            # Count URL occurrences for polling detection
+            url_counts[line_stripped] = url_counts.get(line_stripped, 0) + 1
             mutations.append(line_stripped)
             last_was_mutation = True
-        # Keep "Request body:" lines that follow a kept mutation request
-        elif line_stripped.startswith("Request body:") and last_was_mutation:
+        # Keep "Request body:" and "Response body:" lines that follow a kept mutation request
+        elif (line_stripped.startswith("Request body:") or line_stripped.startswith("Response body:")) and last_was_mutation:
             mutations.append("  " + line_stripped)
         else:
             last_was_mutation = False
@@ -560,151 +409,33 @@ async def _fetch_network_log() -> str:
     if not mutations:
         return ""
 
+    # Auto-blacklist high-frequency URLs (likely polling, not user actions)
+    polling_urls = {url for url, count in url_counts.items() if count > 3}
+    if polling_urls:
+        filtered: list[str] = []
+        skip_body = False
+        for m in mutations:
+            if m in polling_urls:
+                skip_body = True  # skip this URL and its following body lines
+                continue
+            if skip_body and m.startswith("  "):
+                continue  # orphan body line from a removed polling URL
+            skip_body = False
+            filtered.append(m)
+        mutations = filtered
+        logger.info(f"[db] filtered {len(polling_urls)} high-frequency polling URLs from network log")
+
+    if not mutations:
+        return ""
+
     result_str = "\n".join(mutations)
+    # Truncate from HEAD to keep tail (final submit is usually most important)
     if len(result_str) > 3000:
-        result_str = result_str[:3000] + "\n... (truncated)"
+        result_str = "... (earlier mutations truncated)\n" + result_str[-3000:]
 
     return result_str
 
 
-def _build_workflow_summary() -> str:
-    """Build a compact summary of what the UI agent did, for the DB agent's context."""
-    if _evidence_collector is None or not _evidence_collector.items:
-        return ""
-
-    lines: list[str] = []
-    for item in _evidence_collector.items:
-        tool = item["tool"]
-        args = item.get("args", "")
-        result = item.get("result_preview", "")
-
-        if tool == "browser_navigate":
-            # Extract URL
-            try:
-                url = json.loads(args).get("url", args)
-            except Exception:
-                url = args
-            lines.append(f"Navigate: {url}")
-
-        elif tool == "browser_click":
-            # Extract element description
-            try:
-                parsed = json.loads(args)
-                element = parsed.get("element", parsed.get("ref", args))
-            except Exception:
-                element = args[:80]
-            lines.append(f"Click: {element}")
-
-        elif tool in ("browser_type", "browser_fill_form"):
-            # Extract what was filled (redact passwords)
-            try:
-                parsed = json.loads(args)
-                if "fields" in parsed:
-                    fields = [f.get("name", "?") for f in parsed["fields"]]
-                    lines.append(f"Fill form: {', '.join(fields)}")
-                else:
-                    ref = parsed.get("ref", "?")
-                    text = parsed.get("text", "")
-                    if "password" in args.lower():
-                        text = "***"
-                    lines.append(f"Type: ref={ref} text={text[:50]}")
-            except Exception:
-                lines.append(f"Type: {args[:60]}")
-
-        elif tool == "browser_select_option":
-            lines.append(f"Select: {args[:80]}")
-
-        elif tool == "browser_snapshot":
-            # Extract page URL from result
-            url_match = re.search(r"Page URL:\s*(\S+)", result)
-            if url_match:
-                lines.append(f"Page: {url_match.group(1)}")
-
-        elif tool == "browser_take_screenshot":
-            lines.append("Screenshot taken")
-
-        elif tool == "get_test_account":
-            lines.append(f"Get test account: {args}")
-
-    if not lines:
-        return ""
-
-    # Cap at ~30 lines to keep it compact
-    if len(lines) > 30:
-        lines = lines[:15] + [f"... ({len(lines) - 30} steps omitted) ..."] + lines[-15:]
-
-    return "\n".join(lines)
-
-
-def _filter_schema_cache(data_json: str, workflow_summary: str, network_log: str, remembered_tables: list[str] | None = None, db_checks: list[str] | None = None) -> str:
-    """Filter schema cache to tables matching keywords from the context.
-
-    Extracts keywords from UI data, workflow summary, and network log,
-    then returns only matching table schemas. This gives the DB agent
-    enough schema context to write SQL without injecting all 510 tables.
-    """
-    cache = _load_schema_cache()
-    if not cache:
-        return ""
-
-    # Build keyword set from runtime evidence only. db_checks are handled
-    # separately as explicit table names so natural-language phrasing does not
-    # fan out into unrelated schema matches.
-    context = f"{data_json} {workflow_summary} {network_log}".lower()
-
-    # Extract meaningful words (skip very short/common ones)
-    words = set(re.findall(r"[a-z_]{3,}", context))
-    # Add compound terms that might match table names
-    keywords = set()
-    for w in words:
-        keywords.add(w)
-        # Split on underscore to catch partial matches: "newsletter_type" → "newsletter", "type"
-        for part in w.split("_"):
-            if len(part) >= 3:
-                keywords.add(part)
-
-    # Always include common business tables
-    keywords.update({"order", "orders", "customer", "customers", "payment", "product"})
-
-    explicit_tables = set(_extract_db_check_tables(db_checks, cache))
-
-    # Match tables whose name contains any keyword, always keeping explicit
-    # tables named in db_checks even when the rest of the context is sparse.
-    matched: dict[str, str] = {}
-    for db_table, schema in cache.items():
-        table_name = db_table.split(".")[-1].lower()
-        if table_name in explicit_tables or any(kw in table_name for kw in keywords):
-            matched[db_table] = schema
-
-    if not matched:
-        return ""
-
-    # Cap at ~20 tables to keep token budget reasonable
-    if len(matched) > 20:
-        remembered = set(remembered_tables or [])
-        scored = sorted(
-            matched.items(),
-            key=lambda kv: (
-                0 if kv[0].split(".")[-1].lower() in explicit_tables else 1,
-                0 if kv[0].split(".")[-1].lower() in remembered else 1,
-                len(kv[0].split(".")[-1]),
-            ),
-        )
-        matched = dict(scored[:20])
-
-    lines = ["## Relevant DB Schema (from cache — skip describe_table for these)"]
-    for db_table, columns in sorted(matched.items()):
-        lines.append(f"\n### {db_table}")
-        lines.append(columns)
-
-    result = "\n".join(lines)
-    logger.info(
-        "[db] schema hint: %s tables matched from %s cached (explicit db_checks tables: %s)",
-        len(matched),
-        len(cache),
-        sorted(explicit_tables),
-    )
-    return result
 
 
 def _parse_describe_result(result_str: str) -> str:
@@ -881,52 +612,28 @@ async def verify_in_db(data_json: str) -> str:
             "severity": "high",
         }])
 
+    # No db_checks → skip DB verification entirely
+    if not _db_checks:
+        logger.info("[db] no db_checks configured, skipping DB verification")
+        return json.dumps([])
+
     network_log = await _fetch_network_log()
-    workflow_summary = _build_workflow_summary()
-
-    # Memory: scan manifests → LLM picks top 5 → load tables + content
-    # picked_paths reused at save time as merge target (no second LLM call)
-    remembered_tables: list[str] = []
-    memory_content: str = ""
-    picked_paths: list[Path] = []
-    manifest = _scan_memory_manifest()
-    if manifest:
-        manifest = _prefer_same_scenario_memories(manifest, _scenario_name)
-        context = f"UI Data: {data_json}\nWorkflow: {workflow_summary[:500]}\nNetwork: {network_log[:500]}"
-        if _db_checks:
-            context += f"\nDB Checks: {', '.join(_db_checks)}"
-        selected = await _llm_select_memories(manifest, context, top_n=5)
-        if selected:
-            picked_paths = [manifest[i]["_path"] for i in selected]
-            remembered_tables, memory_content = _load_memory_content(picked_paths)
-
-    schema_hint = _filter_schema_cache(data_json, workflow_summary, network_log, remembered_tables, _db_checks)
-
-    # For tables explicitly mentioned in db_checks, get fresh schema via describe_table (bypasses cache)
     live_schema = await _describe_db_checks_tables()
 
     db_agent = create_db_agent(
         mcp_servers=_db_mcp_servers,
         model=_model,
-        network_log=network_log,
-        workflow_summary=workflow_summary,
-        code_root_dir=_code_root_dir,
-        schema_hint=schema_hint,
-        live_schema=live_schema,
         db_checks=_db_checks,
-        verify_memory=memory_content,
+        live_schema=live_schema,
+        network_log=network_log,
+        code_root_dir=_code_root_dir,
     )
     logger.info(f"[db] starting DB agent with data={data_json[:200]}")
     if network_log:
         logger.info(f"[db] injecting network log ({len(network_log)} chars)")
-    if workflow_summary:
-        logger.info(f"[db] injecting workflow summary ({len(workflow_summary)} chars)")
-    if schema_hint:
-        logger.info(f"[db] injecting schema hint ({len(schema_hint)} chars)")
     if live_schema:
         logger.info(f"[db] injecting live schema for db_checks tables ({len(live_schema)} chars)")
-    if _db_checks:
-        logger.info(f"[db] injecting {len(_db_checks)} verification hints from scenario")
+    logger.info(f"[db] injecting {len(_db_checks)} verification checks from scenario")
 
     # Record everything passed to DB agent in the trace for debugging
     if _trace_recorder is not None:
@@ -934,11 +641,8 @@ async def verify_in_db(data_json: str) -> str:
             "db_handoff",
             "DB Agent Handoff",
             f"## UI Data\n{data_json}\n\n"
-            f"## Workflow Summary\n{workflow_summary or '(none)'}\n\n"
             f"## Network Log\n{network_log or '(none)'}\n\n"
-            f"## Live Schema\n{live_schema or '(none)'}\n\n"
-            f"## Schema Hint\n{schema_hint or '(none)'}\n\n"
-            f"## Memory\n{memory_content or '(none)'}",
+            f"## Live Schema\n{live_schema or '(none)'}",
         )
 
     try:

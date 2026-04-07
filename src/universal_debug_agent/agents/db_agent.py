@@ -17,94 +17,32 @@ class DBVerificationOutput(BaseModel):
     verifications: list[DataVerification]
 
 
-_DB_PROMPT = """You are a database verification agent. You verify that a UI workflow actually persisted the correct data in the database.
+_DB_PROMPT_FOCUSED = """You are a database verification agent.
 
 ## What you receive
 
-- **UI Data**: Key business values the UI agent extracted (may be sparse — not all workflows show IDs on screen)
-- **Workflow Summary**: What the UI agent did — pages visited, buttons clicked, forms filled
-- **Network Log**: API calls captured during the test (POST/PUT/PATCH/DELETE with request bodies)
-- **Relevant DB Schema**: Pre-cached table schemas with column names and types
+- **Verification Checklist**: Exact checks to perform (from scenario config)
+- **Live Schema**: Target table definitions with column names and types
+- **Network Log**: Mutation requests (POST/PUT/PATCH/DELETE) with request and response bodies captured during UI test
+- **UI Data** (user message): Business values visible on the page
 
-## How to work
+## Steps
 
-**Step 1 — Understand the workflow**: Read the workflow summary and network log to understand what business operation was performed. The API endpoints and request body field names are your best clues.
-
-**Step 2 — Identify tables**: Check the "Relevant DB Schema" section first. TRUST the cached schema — use the exact table and column names shown there. Do NOT guess table or column names. If the schema section is empty, use `describe_table` to discover structure before querying.
-
-**Step 3 — Understand relationships**: Use `grep_code` (1-2 calls max) to find the controller or model that handles this workflow. Focus on finding join conditions, foreign keys, and which columns map to the UI values.
-
-**Step 4 — Query the database**: Write precise SQL queries using the EXACT table and column names from schema hints. Execute all queries in one turn. If a query returns an error (wrong column/table), fix it and retry — do NOT give up.
-
-**Step 5 — Output**: Output the final DBVerificationOutput immediately after receiving query results.
+1. Read the checklist — each item tells you what table and condition to verify.
+2. Extract precise values from the network log request/response bodies (e.g. order_ref, payment_method_id, server-returned IDs) to use as WHERE conditions.
+3. If a column stores coded values (e.g. status=1), use `grep_code` to find the enum/constant definition in the codebase.
+4. Write SELECT queries using the EXACT column names from live schema.
+5. Execute queries. If a query errors, fix it and retry — do NOT give up.
+6. Compare results to expected values and output DBVerificationOutput.
 
 ## Rules
-- Only SELECT queries — never INSERT, UPDATE, DELETE, DROP
-- Treat the current run as source of truth: Verification Checklist, UI Data, Live Schema, current schema hints, and current code all outrank any memory from past runs
-- Reuse DB verification memory ONLY when it clearly matches this workflow/checklist and does not conflict with current schema/code
-- If a Verification Checklist is provided below, complete ONLY those checks — no more, no less. Do NOT invent extra checks.
-- If NO checklist is provided, return checks for the most critical business facts for THIS specific workflow. Only include checks you have evidence for — do NOT invent checks to reach a quota
-- Status values:
-  - "pass" — data exists and matches expected
-  - "fail" — data is missing or wrong
-  - "blocked" — ONLY when DB connection fails or MCP server errors (infrastructure issues, not data issues)
-  - If you cannot find the right table after trying: "fail" with actual="Could not locate data — table/column not found after N attempts"
-- severity: high (core business data like order/payment), medium (secondary data), low (metadata)
-- When comparing values, consider semantic equivalence: "Bank Transfer" ≈ "Bank Transfer Payment", "subscribed" ≈ "1" — if meaning is clearly the same, that is a pass
-- Do NOT re-discover tables that are already in the schema hints — use them directly
-- Keep checks focused: one check per business fact (e.g., "order exists", "payment recorded", "correct total")
 
-## Output example
-
-For an order checkout scenario with data {"order_id": "ABC123", "total": "$50.00", "payment_method": "Credit Card"}:
-
-```json
-{
-  "verifications": [
-    {
-      "check_name": "Order ABC123 persisted with correct total",
-      "query": "SELECT orders_id, order_total FROM orders WHERE orders_ref = 'ABC123'",
-      "expected": "Order exists with total = 50.00",
-      "actual": "Found order with orders_id=789, order_total=50.0000",
-      "status": "pass",
-      "severity": "high"
-    },
-    {
-      "check_name": "Payment method recorded as Credit Card",
-      "query": "SELECT payment_method FROM orders WHERE orders_ref = 'ABC123'",
-      "expected": "payment_method contains 'Credit Card'",
-      "actual": "payment_method = 'Credit Card'",
-      "status": "pass",
-      "severity": "high"
-    }
-  ]
-}
-```
-
-For a newsletter subscription with data {"email": "user@example.com", "newsletter_type": "Weekly Digest"}:
-
-```json
-{
-  "verifications": [
-    {
-      "check_name": "Customer email exists in database",
-      "query": "SELECT customers_id FROM customers WHERE customers_email_address = 'user@example.com'",
-      "expected": "Customer record exists",
-      "actual": "Found customers_id=42",
-      "status": "pass",
-      "severity": "high"
-    },
-    {
-      "check_name": "Newsletter subscription record created",
-      "query": "SELECT * FROM customer_newsletter_subscriptions cn JOIN customers c ON cn.customer_id = c.customers_id WHERE c.customers_email_address = 'user@example.com'",
-      "expected": "Subscription row exists for Weekly Digest",
-      "actual": "No matching subscription row found",
-      "status": "fail",
-      "severity": "high"
-    }
-  ]
-}
-```
+- Only SELECT — never INSERT, UPDATE, DELETE, DROP.
+- Complete ONLY the checklist checks — no more, no less.
+- Status: "pass" (matches), "fail" (missing/wrong), "blocked" (DB connection/MCP error only).
+- Severity: "high" (core business data), "medium" (secondary), "low" (metadata).
+- Semantic equivalence is a pass: "Bank Transfer" ≈ "bank_transfer", "subscribed" ≈ "1".
+- One check per business fact.
 """
 
 
@@ -214,48 +152,28 @@ def grep_code(pattern: str, directory: str = "", file_glob: str = "*") -> str:
 def create_db_agent(
     mcp_servers: list[MCPServerStdio],
     model: Any = None,
-    network_log: str = "",
-    workflow_summary: str = "",
-    code_root_dir: str = "",
-    schema_hint: str = "",
     db_checks: list[str] | None = None,
-    verify_memory: str = "",
     live_schema: str = "",
+    network_log: str = "",
+    code_root_dir: str = "",
 ) -> Agent:
-    """Create a DB verification agent with DB MCP tools and code browsing tools."""
+    """Create a DB verification agent with DB MCP tools and optional code search."""
     global _code_root_dir
     _code_root_dir = code_root_dir
 
-    instructions = _DB_PROMPT
+    instructions = _DB_PROMPT_FOCUSED
     if db_checks:
         checks_text = "\n".join(f"{i}. {c}" for i, c in enumerate(db_checks, 1))
         instructions += (
             f"\n## Verification Checklist (from scenario config)\n\n"
-            f"{checks_text}\n\n"
-            f"Complete ONLY these {len(db_checks)} checks — no more, no less. "
-            f"Do NOT add extra checks beyond this list. "
-            f"Use the UI data and schema hints to write the SQL.\n"
+            f"{checks_text}\n"
         )
     if live_schema:
         instructions += f"\n{live_schema}\n"
-    if verify_memory:
-        instructions += (
-            f"\n{verify_memory}\n\n"
-            f"Use the memory above only as supplemental guidance from previous successful runs. "
-            f"If the checklist, live schema, cached schema hints, network log, or current code disagree, "
-            f"trust the current run and ignore the memory.\n"
-        )
-    if workflow_summary:
-        instructions += f"\n## Workflow Summary (what the UI agent did)\n\n```\n{workflow_summary}\n```\n"
     if network_log:
         instructions += f"\n## Network Log (API calls captured during UI test)\n\n```\n{network_log}\n```\n"
-    if schema_hint:
-        instructions += f"\n{schema_hint}\n"
 
-    # Code tools are only available if code_root_dir is set
-    tools = []
-    if code_root_dir:
-        tools = [read_file, grep_code]
+    tools = [grep_code, read_file] if code_root_dir else []
 
     return Agent(
         name="DBVerifier",
