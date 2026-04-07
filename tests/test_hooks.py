@@ -123,3 +123,117 @@ def test_summarize_tool_result_extracts_page_url():
 def test_summarize_tool_result_extracts_screenshot_name():
     result = "- [Screenshot of viewport](checkout.png)"
     assert _summarize_tool_result("browser_take_screenshot", result) == "screenshot=checkout.png"
+
+
+# --- Form capture tests ---
+
+class _MockMCPResult:
+    """Simulates an MCP call_tool result with structured content."""
+    def __init__(self, text: str):
+        self.content = [type("Item", (), {"text": text})()]
+
+
+class _MockPlaywrightServer:
+    """Mock Playwright MCP server that returns configurable results."""
+    def __init__(self, evaluate_result: str | None = None, error: Exception | None = None):
+        self._evaluate_result = evaluate_result
+        self._error = error
+        self.calls: list[tuple[str, dict]] = []
+
+    async def call_tool(self, tool_name: str, args: dict):
+        self.calls.append((tool_name, args))
+        if self._error is not None:
+            raise self._error
+        if self._evaluate_result is not None:
+            return _MockMCPResult(self._evaluate_result)
+        return _MockMCPResult("null")
+
+
+def _hooks_with_playwright(server) -> InvestigationHooks:
+    return InvestigationHooks(
+        stuck_detector=_DummyDetector(),
+        evidence_collector=_DummyEvidenceCollector(),
+        playwright_server=server,
+    )
+
+
+def _wrap_evaluate_result(data_json: str) -> str:
+    """Wrap JSON in the format browser_evaluate actually returns."""
+    return (
+        f"### Result\n{data_json}\n"
+        "### Ran Playwright code\n```js\nawait page.evaluate(...);\n```"
+    )
+
+
+@pytest.mark.asyncio
+async def test_form_capture_before_click():
+    """Form data is captured when browser_click targets an element inside a form."""
+    from universal_debug_agent.tools import db_tool
+
+    form_data = json.dumps({
+        "action": "https://example.test/newsletter",
+        "method": "POST",
+        "fields": {"email": "test@test.com", "subscribed": "1"},
+    }, indent=2)
+    server = _MockPlaywrightServer(evaluate_result=_wrap_evaluate_result(form_data))
+    hooks = _hooks_with_playwright(server)
+    context = _DummyToolContext(json.dumps({"ref": "e141", "element": "Submit"}))
+
+    db_tool.clear_captured_form_data()
+    await hooks.on_tool_start(context, agent=None, tool=_DummyTool("browser_click"))
+
+    assert len(db_tool._captured_form_data) == 1
+    assert db_tool._captured_form_data[0]["action"] == "https://example.test/newsletter"
+    assert db_tool._captured_form_data[0]["fields"]["email"] == "test@test.com"
+    # Verify browser_evaluate was called with the correct ref
+    assert any(name == "browser_evaluate" for name, _ in server.calls)
+    db_tool.clear_captured_form_data()
+
+
+@pytest.mark.asyncio
+async def test_no_capture_for_non_form_click():
+    """No form data captured when element is not inside a form."""
+    from universal_debug_agent.tools import db_tool
+
+    # browser_evaluate returns "null" wrapped in ### Result format when element is not in a form
+    server = _MockPlaywrightServer(evaluate_result="### Result\nnull\n### Ran Playwright code\n```js\n```")
+    hooks = _hooks_with_playwright(server)
+    context = _DummyToolContext(json.dumps({"ref": "e100", "element": "Some link"}))
+
+    db_tool.clear_captured_form_data()
+    await hooks.on_tool_start(context, agent=None, tool=_DummyTool("browser_click"))
+
+    assert len(db_tool._captured_form_data) == 0
+    db_tool.clear_captured_form_data()
+
+
+@pytest.mark.asyncio
+async def test_form_capture_failure_nonfatal():
+    """browser_evaluate failure does not block the click."""
+    from universal_debug_agent.tools import db_tool
+
+    server = _MockPlaywrightServer(error=RuntimeError("MCP connection lost"))
+    hooks = _hooks_with_playwright(server)
+    context = _DummyToolContext(json.dumps({"ref": "e141", "element": "Submit"}))
+
+    db_tool.clear_captured_form_data()
+    # Should not raise — failure is silently caught
+    await hooks.on_tool_start(context, agent=None, tool=_DummyTool("browser_click"))
+
+    assert len(db_tool._captured_form_data) == 0
+    db_tool.clear_captured_form_data()
+
+
+@pytest.mark.asyncio
+async def test_no_capture_without_playwright():
+    """No error when hooks have no playwright server."""
+    from universal_debug_agent.tools import db_tool
+
+    hooks = _hooks()  # no playwright_server
+    context = _DummyToolContext(json.dumps({"ref": "e141", "element": "Submit"}))
+
+    db_tool.clear_captured_form_data()
+    await hooks.on_tool_start(context, agent=None, tool=_DummyTool("browser_click"))
+
+    assert len(db_tool._captured_form_data) == 0
+    db_tool.clear_captured_form_data()

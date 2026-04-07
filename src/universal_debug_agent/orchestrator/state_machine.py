@@ -225,6 +225,7 @@ class InvestigationOrchestrator:
             db_checks=db_checks,
             scenario_name=scenario_name,
         )
+        db_tool.clear_captured_form_data()
 
     @staticmethod
     def _find_playwright_cwd(mcp_servers: list[MCPServerStdio]) -> Path | None:
