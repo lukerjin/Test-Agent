@@ -244,6 +244,10 @@ async def _run_test(
         f"tokens in/out/total: "
         f"{usage_summary.input_tokens}/{usage_summary.output_tokens}/{usage_summary.total_tokens}[/dim]"
     )
+    if orchestrator.generated_test_path:
+        console.print(
+            f"[green bold]Generated test:[/green bold] {orchestrator.generated_test_path}"
+        )
     if orchestrator.last_raw_output_path:
         console.print(f"[dim]Raw final output: {orchestrator.last_raw_output_path}[/dim]")
     console.print(f"[dim]Execution trace: {trace_recorder.md_path}[/dim]")

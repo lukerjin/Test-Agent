@@ -10,6 +10,8 @@ from typing import Any
 
 from agents import Agent, RunContextWrapper, RunHooks, Tool
 from agents.exceptions import UserError
+from universal_debug_agent.generators.action_log import ActionLog
+from universal_debug_agent.generators.selector_resolver import SnapshotRefMap
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
 from universal_debug_agent.tools import db_tool
 
@@ -105,6 +107,21 @@ class InvestigationHooks(RunHooks):
     # Tools that change page state — refs from their snapshot are stale after page reload
     _PAGE_CHANGING_TOOLS = {"browser_click", "browser_navigate"}
 
+    # Tools whose args contain a target element ref
+    _REF_TOOLS = {"browser_click", "browser_type", "browser_fill_form", "browser_select_option"}
+
+    # Mapping from Playwright MCP tool name to ActionRecord action_type
+    _ACTION_TYPE_MAP = {
+        "browser_navigate": "navigate",
+        "browser_click": "click",
+        "browser_type": "type",
+        "browser_fill_form": "fill",
+        "browser_select_option": "select",
+        "browser_press_key": "press_key",
+        "browser_wait_for": "wait",
+        "browser_handle_dialog": "dialog",
+    }
+
     def __init__(
         self,
         stuck_detector: Any,
@@ -121,6 +138,9 @@ class InvestigationHooks(RunHooks):
         self._pending_tool_args: dict[str, list[str]] = {}
         # Auto-snapshot captured after click/navigate — consumed by input_filters
         self.pending_auto_snapshot: str | None = None
+        # --- v2 codegen: action recording ---
+        self.action_log = ActionLog()
+        self.ref_map = SnapshotRefMap()
 
     async def on_llm_end(
         self, context: RunContextWrapper, agent: Agent, response
@@ -162,6 +182,13 @@ class InvestigationHooks(RunHooks):
             )
         logger.info(f"[action] {tool_name}({_compact_jsonish(tool_args, 160)})")
 
+        # --- v2 codegen: record browser action ---
+        self._record_action(tool_name, tool_args)
+
+        # --- v2 codegen: resolve DOM attributes for ref-based actions ---
+        if tool_name in self._REF_TOOLS and self._playwright_server is not None:
+            await self._resolve_dom_attrs(tool_name, tool_args)
+
     async def on_tool_end(
         self, context: RunContextWrapper, agent: Agent, tool: Tool, result: str
     ) -> None:
@@ -181,6 +208,14 @@ class InvestigationHooks(RunHooks):
             )
 
         logger.info(f"[result]  {tool_name} -> {_summarize_tool_result(tool_name, result_str)}")
+
+        # --- v2 codegen: update ref map from any snapshot content in results ---
+        if result_str and "[ref=" in result_str:
+            self.ref_map.merge_from_snapshot(result_str)
+
+        # --- v2 codegen: record DB verification results ---
+        if tool_name == "verify_in_db" and result_str:
+            self._record_db_verify(result_str)
 
         # Auto-snapshot after page-changing actions to ensure fresh refs
         if tool_name in self._PAGE_CHANGING_TOOLS and self._playwright_server is not None:
@@ -222,6 +257,8 @@ class InvestigationHooks(RunHooks):
                     text = getattr(item, "text", None) or (item.get("text") if isinstance(item, dict) else None)
                     if text and "```yaml" in text:
                         self.pending_auto_snapshot = text
+                        # v2 codegen: keep ref_map current after page changes
+                        self.ref_map.merge_from_snapshot(text)
                         logger.info(f"[auto-snapshot] captured fresh snapshot after {tool_name}")
                         return
             logger.warning(f"[auto-snapshot] no yaml content in snapshot result after {tool_name}")
@@ -317,6 +354,270 @@ class InvestigationHooks(RunHooks):
                 )
         except Exception as e:
             logger.debug(f"[form-capture] failed for ref={ref}: {e}")
+
+    # --- v2 codegen helpers ---
+
+    # JS that finds the element by Playwright MCP ref and returns its HTML attributes.
+    # Playwright MCP stores refs as data-ref attributes on elements.
+    _RESOLVE_REF_JS = """(ref) => {
+        // Playwright MCP annotates elements with __playwright_ref or similar.
+        // The most reliable way: find by aria snapshot ref id.
+        // Since we can't query by ref directly, we query all interactive elements
+        // and match by proximity. Instead, use a simpler approach:
+        // query all elements with the matching innerText or role, then return attrs.
+        // Actually, Playwright MCP uses internal ref mapping, not DOM attributes.
+        // So we query the focused/active element or use a broader selector.
+        // Fallback: return all form inputs on the page for the codegen to pick from.
+        return null;
+    }"""
+
+    async def _resolve_dom_attrs(self, tool_name: str, tool_args_str: str) -> None:
+        """Use browser_evaluate to get real HTML attributes for the target element.
+
+        Updates the most recently recorded ActionRecord(s) with DOM attributes
+        (id, name, type, tag, class) so codegen can build precise locators.
+        """
+        if not self.action_log.records:
+            return
+
+        try:
+            args = json.loads(tool_args_str) if tool_args_str else {}
+        except Exception:
+            return
+
+        # Collect refs to resolve
+        refs_to_resolve: list[str] = []
+        if tool_name == "browser_fill_form" and "fields" in args:
+            refs_to_resolve = [f.get("ref", "") for f in args["fields"] if f.get("ref")]
+        else:
+            ref = args.get("ref", "")
+            if ref:
+                refs_to_resolve = [ref]
+
+        if not refs_to_resolve:
+            return
+
+        # Build JS that queries all interactive elements and returns their attributes.
+        # We'll match by comparing against the ARIA snapshot info we already have.
+        js = """() => {
+            const els = document.querySelectorAll(
+                'input, select, textarea, button, a, [role="button"], [role="link"], ' +
+                '[role="textbox"], [role="combobox"], [role="checkbox"], [role="radio"], ' +
+                '[role="tab"], [role="menuitem"], [role="option"], [type="submit"]'
+            );
+            return Array.from(els).map(el => ({
+                tag: el.tagName.toLowerCase(),
+                id: el.id || '',
+                name: el.getAttribute('name') || '',
+                type: el.getAttribute('type') || '',
+                className: (el.className && typeof el.className === 'string') ? el.className.slice(0, 100) : '',
+                role: el.getAttribute('role') || '',
+                text: (el.textContent || '').trim().slice(0, 80),
+                ariaLabel: el.getAttribute('aria-label') || '',
+                placeholder: el.getAttribute('placeholder') || '',
+                href: el.getAttribute('href') || '',
+            }));
+        }"""
+
+        try:
+            result = await self._playwright_server.call_tool("browser_evaluate", {"expression": js})
+            content = getattr(result, "content", result)
+            # Extract text from MCP result
+            raw = ""
+            if isinstance(content, list):
+                for item in content:
+                    text = getattr(item, "text", None) or (item.get("text") if isinstance(item, dict) else None)
+                    if text:
+                        raw = text
+                        break
+            elif isinstance(content, str):
+                raw = content
+
+            if not raw:
+                return
+
+            elements = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(elements, list):
+                return
+
+            # Match each ref to a DOM element by comparing ARIA info
+            for ref in refs_to_resolve:
+                info = self.ref_map.get(ref)
+                if not info:
+                    continue
+
+                match = self._match_dom_element(info, elements)
+                if not match:
+                    continue
+
+                # Find the ActionRecord(s) that used this ref and update them
+                for rec in reversed(self.action_log.records):
+                    if rec.ref == ref and not rec.element_id and not rec.element_html_name:
+                        rec.element_id = match.get("id", "")
+                        rec.element_html_name = match.get("name", "")
+                        rec.element_type = match.get("type", "")
+                        rec.element_tag = match.get("tag", "")
+                        rec.element_class = match.get("className", "")
+                        logger.debug(
+                            f"[codegen] resolved ref={ref} -> "
+                            f"id={rec.element_id!r} name={rec.element_html_name!r} "
+                            f"type={rec.element_type!r} tag={rec.element_tag!r}"
+                        )
+                        break
+
+        except Exception as e:
+            logger.debug(f"[codegen] DOM resolve failed: {e}")
+
+    @staticmethod
+    def _match_dom_element(aria_info, elements: list[dict]) -> dict | None:
+        """Match an ARIA ElementInfo to a DOM element by role, name, and label."""
+        role = aria_info.role.lower()
+        name = aria_info.name.lower().strip()
+
+        # Map ARIA roles to HTML tags/types for matching
+        role_to_tags = {
+            "button": ("button", "input"),
+            "link": ("a",),
+            "textbox": ("input", "textarea"),
+            "combobox": ("select", "input"),
+            "checkbox": ("input",),
+            "radio": ("input",),
+            "searchbox": ("input",),
+            "spinbutton": ("input",),
+        }
+        expected_tags = role_to_tags.get(role, ())
+
+        best = None
+        best_score = 0
+
+        for el in elements:
+            score = 0
+            tag = el.get("tag", "")
+            el_role = el.get("role", "")
+
+            # Tag/role match
+            if expected_tags and tag in expected_tags:
+                score += 1
+            if el_role == role:
+                score += 2
+
+            # Type match for specific roles
+            if role == "checkbox" and el.get("type") == "checkbox":
+                score += 2
+            elif role == "radio" and el.get("type") == "radio":
+                score += 2
+            elif role == "spinbutton" and el.get("type") == "number":
+                score += 2
+
+            if score == 0:
+                continue
+
+            # Name matching: check aria-label, placeholder, text, name attr
+            el_texts = [
+                el.get("ariaLabel", "").lower().strip(),
+                el.get("placeholder", "").lower().strip(),
+                el.get("text", "").lower().strip(),
+                el.get("name", "").lower().strip(),
+            ]
+            if name:
+                for et in el_texts:
+                    if et and name in et:
+                        score += 3
+                        break
+                    if et and et in name:
+                        score += 2
+                        break
+
+            if score > best_score:
+                best_score = score
+                best = el
+
+        return best if best_score >= 3 else None
+
+    def _record_action(self, tool_name: str, tool_args_str: str) -> None:
+        """Record a browser action in the action log for codegen."""
+        action_type = self._ACTION_TYPE_MAP.get(tool_name)
+        if action_type is None:
+            return  # not a recordable browser action
+
+        try:
+            args = json.loads(tool_args_str) if tool_args_str else {}
+        except Exception:
+            args = {}
+
+        kwargs: dict = {}
+
+        if action_type == "navigate":
+            kwargs["url"] = args.get("url", "")
+
+        elif action_type == "fill" and "fields" in args:
+            # browser_fill_form: args = {"fields": [{"name": "Email", "type": "textbox", "ref": "e39", "value": "..."}]}
+            # Expand each field into its own fill record
+            for field in args["fields"]:
+                ref = field.get("ref", "")
+                info = self.ref_map.get(ref) if ref else None
+                # browser_fill_form provides the correct field name in args —
+                # always prefer it over ref_map which may have stale data from
+                # a previous page where the same ref pointed to a different element.
+                field_name = field.get("name", "")
+                self.action_log.record(
+                    "fill",
+                    ref=ref,
+                    element_role=info.role if info else field.get("type", "textbox"),
+                    element_name=field_name or (info.name if info else ""),
+                    value=field.get("value", ""),
+                )
+            return  # already recorded — skip the generic record below
+
+        elif action_type in ("click", "fill", "type", "select"):
+            ref = args.get("ref", "")
+            kwargs["ref"] = ref
+            # Resolve element role + name from the ref map
+            info = self.ref_map.get(ref) if ref else None
+            if info:
+                kwargs["element_role"] = info.role
+                kwargs["element_name"] = info.name
+            else:
+                # Fallback: use the 'element' description from args if available
+                kwargs["element_name"] = args.get("element", "")
+
+            if action_type in ("fill", "type"):
+                kwargs["value"] = args.get("text", args.get("value", ""))
+            elif action_type == "select":
+                values = args.get("values", [])
+                kwargs["value"] = values[0] if values else args.get("value", "")
+
+        elif action_type == "press_key":
+            kwargs["value"] = args.get("key", "")
+
+        elif action_type == "wait":
+            kwargs["value"] = args.get("text", args.get("selector", str(args)))
+
+        elif action_type == "dialog":
+            kwargs["value"] = args.get("action", args.get("text", "accept"))
+
+        self.action_log.record(action_type, **kwargs)
+
+    def _record_db_verify(self, result_str: str) -> None:
+        """Parse verify_in_db result and record each check in the action log."""
+        try:
+            verifications = json.loads(result_str)
+        except Exception:
+            return
+        if not isinstance(verifications, list):
+            return
+
+        for v in verifications:
+            if not isinstance(v, dict):
+                continue
+            self.action_log.record(
+                "db_verify",
+                check_name=v.get("check_name", ""),
+                query=v.get("query", ""),
+                expected=v.get("expected", ""),
+                actual=v.get("actual", ""),
+                status=v.get("status", ""),
+            )
 
     def _tool_args(self, context: RunContextWrapper, tool: Tool) -> str:
         if hasattr(context, "tool_arguments"):
