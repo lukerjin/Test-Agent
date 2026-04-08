@@ -1,73 +1,75 @@
 # Universal Test Agent
 
-基于 [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) 的通用 E2E 测试执行 + 数据验证 agent。
+An AI-powered E2E test execution and data verification agent built on the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
 
-给它一个业务场景（自然语言），它自己走完整个流程，遇到障碍自己解决，最后验证数据库里的数据对不对。**任意 scenario，不限于某一种固定流程。**
+Give it a business scenario in natural language. It walks through the entire flow, handles obstacles on its own, and verifies that the right data landed in the database. **Any scenario, not limited to a fixed flow.**
 
-## 它能做什么
+## What It Does
 
-- **执行任意业务流程** — 购买、注册、退款、权限检查、搜索... 任何你能用自然语言描述的 scenario
-- **自动处理障碍** — 没登录就登录，有弹窗就关掉，加载慢就等
-- **收集证据** — 关键步骤自动截图、记录页面状态
-- **数据验证** — 流程走完后查数据库，确认数据落库正确；支持 scenario 级 `db_checks` 精确指定验证项
-- **结构化报告** — 每步 pass/fail + 每项数据验证 pass/fail
-- **测试记忆（RAG）** — 每次 run 结束自动提炼 lesson，下次相同场景自动注入，覆盖 scenario 步骤里的错误方式
-- **多 LLM 支持** — OpenAI / Gemini / DeepSeek / Groq，一行切换
-- **多项目通用** — 一套代码，每个项目一个 YAML 配置
+- **Execute any business flow** — checkout, registration, refunds, permissions, search... anything you can describe in natural language
+- **Handle obstacles automatically** — not logged in? logs in. popup? dismisses it. slow load? waits
+- **Collect evidence** — auto-screenshots at key steps, records page state
+- **Verify data** — after the flow completes, queries the database to confirm data persisted correctly; supports scenario-level `db_checks` for precise verification
+- **Capture form submissions** — traditional `<form>` POSTs (page reload) are captured via `browser_evaluate` before click, so DB agent sees the submitted field values
+- **Structured reports** — per-step pass/fail + per-check data verification pass/fail
+- **Test memory (RAG)** — auto-extracts lessons after each run, injects relevant ones into future runs of the same scenario
+- **Multi-LLM support** — OpenAI / Gemini / DeepSeek / Groq, switch with one line
+- **Multi-project** — one codebase, one YAML config per project
 
-## 架构
+## Architecture
 
 ```
-┌────────────────────────────────────────────────────────────┐
-│            UI Agent (ReAct / Analysis) — 无 DB 访问          │
-│           Orchestrator + StuckDetector 控制模式切换          │
-├──────────┬──────────┬──────────┬──────────────────────────┤
-│Playwright│  Code    │Memory    │  verify_in_db (tool)     │
-│  MCP     │  Tools   │  RAG     │  ┌────────────────────┐  │
-│ 操作页面  │ 读代码   │JSONL+tag │  │   DB Sub-Agent     │  │
-│ 截图/快照 │ 搜索     │lesson注入│  │  独立 Runner.run() │  │
-│ auto-snap│          │          │  │  DB MCP (只读)     │  │
-│          │          │          │  │  Schema Hints      │  │
-│          │          │          │  │  Network Log       │  │
-│          │          │          │  │  Workflow Summary   │  │
-│          │          │          │  │  db_checks (YAML)  │  │
-│          │          │          │  └────────────────────┘  │
-├──────────┴──────────┴──────────┴──────────────────────────┤
-│        LLM Provider (OpenAI / Gemini / DeepSeek / ...)     │
-├────────────────────────────────────────────────────────────┤
-│                  Project Profile (YAML)                     │
-│         每个项目独立配置环境、认证、LLM、边界、工具            │
-└────────────────────────────────────────────────────────────┘
++------------------------------------------------------------+
+|         UI Agent (ReAct / Analysis) -- no DB access        |
+|        Orchestrator + StuckDetector control mode switching  |
++----------+----------+----------+---------------------------+
+|Playwright|  Code    |Memory    |  verify_in_db (tool)      |
+|  MCP     |  Tools   |  RAG     |  +----------------------+ |
+| browse   | read_file|JSONL+tag |  |   DB Sub-Agent       | |
+| snapshot | grep_code|lesson    |  |  independent Runner  | |
+| auto-snap|          |injection |  |  DB MCP (read-only)  | |
+| form     |          |          |  |  Live Schema         | |
+| capture  |          |          |  |  Network Log         | |
+|          |          |          |  |  Form Capture Data   | |
+|          |          |          |  |  db_checks (YAML)    | |
+|          |          |          |  |  DB Verify Memory    | |
+|          |          |          |  +----------------------+ |
++----------+----------+----------+---------------------------+
+|       LLM Provider (OpenAI / Gemini / DeepSeek / ...)      |
++------------------------------------------------------------+
+|                  Project Profile (YAML)                     |
+|     per-project config: env, auth, LLM, boundaries, tools  |
++------------------------------------------------------------+
 ```
 
 ---
 
-## 快速开始
+## Quick Start
 
-### 1. 安装
+### 1. Install
 
 ```bash
 cd Test-Agent
 pip install -e .
 ```
 
-### 2. 设置 API Key
+### 2. Set API Key
 
 ```bash
 # OpenAI
-export OPENAI_API_KEY=你的key
+export OPENAI_API_KEY=your_key
 
-# 或 Gemini（有免费额度）
-export GEMINI_API_KEY=你的key
+# Or Gemini (free tier available)
+export GEMINI_API_KEY=your_key
 ```
 
-### 3. 创建 Project Profile
+### 3. Create a Project Profile
 
 ```bash
 cp profiles/example_project.yaml profiles/my_project.yaml
 ```
 
-编辑关键字段（完整参考见 [Profile 完整参考](#profile-完整参考)）：
+Edit key fields (full reference below):
 
 ```yaml
 project:
@@ -81,24 +83,24 @@ code:
   root_dir: "/home/user/my-project"
 ```
 
-### 4. 验证 Profile
+### 4. Validate the Profile
 
 ```bash
 test-agent validate-profile profiles/my_project.yaml
 ```
 
-### 5. 运行测试
+### 5. Run a Test
 
 ```bash
-# 直接传 scenario
+# Pass scenario directly
 test-agent test \
   -p profiles/my_project.yaml \
-  -s "购买产品 A：加入购物车，checkout，填写地址，付款，确认订单成功"
+  -s "Add product to cart, checkout, fill address, pay, confirm order"
 
-# 使用 profile 里预定义的 scenario 名
+# Use a named scenario from the profile
 test-agent test -p profiles/my_project.yaml -s checkout
 
-# 列出所有可用 scenario
+# List all available scenarios
 test-agent test -p profiles/my_project.yaml
 ```
 
@@ -107,161 +109,187 @@ test-agent test -p profiles/my_project.yaml
 ## Workflow
 
 ```
-            你写的                      Agent 自动完成
-    ┌───────────────────┐     ┌─────────────────────────────────────┐
-    │  1. Profile YAML  │     │  3. 加载 Memory — 检索相关历史 lesson  │
-    │  (一次性，per项目)  │     │  4. 拆解 scenario 为步骤              │
-    │                   │     │  5. 用 Playwright 逐步执行页面操作    │
-    │  2. --scenario    │────▶│  6. 遇到障碍自己解决（登录/弹窗/等待） │
-    │  (每次测试一句话)   │     │  7. 关键步骤截图                      │
-    │                   │     │  8. 查 DB 验证数据正确性              │
-    └───────────────────┘     │  9. 输出结构化报告 (pass/fail)        │
-                              │  10. LessonWriter 提炼 lesson 写入记忆 │
-                              └─────────────────────────────────────┘
+       You write                        Agent does automatically
++---------------------+     +------------------------------------------+
+|  1. Profile YAML    |     |  3. Load Memory -- retrieve past lessons |
+|  (one-time, per     |     |  4. Break scenario into steps            |
+|   project)          |     |  5. Execute each step via Playwright     |
+|                     |---->|  6. Handle obstacles (login/popup/wait)  |
+|  2. --scenario      |     |  7. Screenshot key steps                 |
+|  (one sentence per  |     |  8. Query DB to verify data correctness  |
+|   test run)         |     |  9. Output structured report (pass/fail) |
++---------------------+     |  10. LessonWriter extracts lesson to     |
+                             |      memory for next run                 |
+                             +------------------------------------------+
 ```
 
-### 详细执行流程
+### Detailed Execution Flow
 
 ```
-输入: -s "购买产品 A，验证订单数据"
-        │
-        ▼
-1. 加载 Profile
-   ├── 读取项目配置（环境/认证/边界）
-   ├── 创建 LLM（Gemini/OpenAI/...）
-   ├── 检索 Memory — 按 tags 匹配历史 lesson，注入 prompt（优先级高于 scenario 步骤）
-   └── 启动 MCP servers（Playwright + DB）
-        │
-        ▼
-2. ReAct 执行循环
-   ├── Think: "第一步应该打开商品页"
-   ├── Act:   browser_navigate → 商品页
-   ├── Observe: snapshot（当前轮完整 ARIA tree，历史轮只保留 URL/title）
-   ├── Think: "找到 Add to Cart 按钮 ref=e144"
-   ├── Act:   browser_click ref=e144
-   ├── Observe: click result 内含更新后的 snapshot
-   ├── ...继续直到流程走完...
-   │
-   │   遇到障碍时:
-   │   ├── 需要登录 → 自动用 profile 里的测试账号登录
-   │   ├── 有弹窗 → 自动关闭
-   │   └── 页面加载慢 → 等待
-   │
-   └── 每步记录: step_number, action, status, screenshot
-        │
-        ▼
-3. 数据验证（流程完成后触发）
-   ├── UI agent 从成功页提取业务数据（order_id / total / email 等）存入 extracted_data
-   ├── 调用 verify_in_db(extracted_data) 工具
-   │   └── 启动独立 DB Sub-Agent（新 Runner.run，context 从零开始）
-   │       ├── 自动注入 Workflow Summary（UI agent 做了什么）
-   │       ├── 自动注入 Network Log（浏览器 mutation API 请求 + request body）
-   │       ├── 注入 Schema Hints（从本地 cache 关键词匹配，最多 20 张表）
-   │       ├── 注入 db_checks（如果 scenario 配置了验证清单）
-   │       ├── 可选 grep_code 查找代码中的表关系（1-2 次）
-   │       ├── 一次性批量执行 2-3 条 SELECT 验证
-   │       └── 返回 DataVerification JSON 数组给 UI agent
-   └── UI agent 将结果原样写入报告的 data_verifications（不修改）
-        │
-        ▼
-4. 卡住检测（StuckDetector，全程监控）
-   ├── 连续 3 次相同 tool call → 卡住
-   ├── 最近 5 次结果完全相同 → 卡住
-   └── 超过 stuck_budget_ratio 仍无报告 → 卡住
-   → 自动切换 Analysis 模式：停止调用工具，汇总证据，输出分析报告
-        │
-        ▼
-5. 输出报告
-   ├── 终端: 彩色表格（Steps + Verifications）
-   ├── JSON: 完整结构化报告
-   ├── trace.md / trace.jsonl: 完整执行轨迹（用于调试）
-   └── usage summary: LLM token 用量统计
-        │
-        ▼
-6. LessonWriter（独立 LLM call）
-   ├── 分析本次 run 的 steps / issues / next_steps
-   ├── 生成 1 段 actionable lesson + tags（checkout, p-16227, bank-transfer...）
-   └── 写入 Memory JSONL — 下次相同场景自动检索注入
+Input: -s "Buy product A, verify order data"
+        |
+        v
+1. Load Profile
+   +-- Read project config (env / auth / boundaries)
+   +-- Create LLM (OpenAI / Gemini / ...)
+   +-- Retrieve Memory -- match past lessons by tags, inject into prompt
+   +-- Start MCP servers (Playwright + DB)
+        |
+        v
+2. ReAct Execution Loop
+   +-- Think: "First step: open product page"
+   +-- Act:   browser_navigate -> product page
+   +-- Observe: snapshot (full ARIA tree for current turn, URL/title only for old turns)
+   +-- Think: "Found Add to Cart button ref=e144"
+   +-- Act:   browser_click ref=e144 (auto-snapshot provides fresh refs after click)
+   +-- Observe: click result with updated snapshot
+   +-- ...continue until flow is complete...
+   |
+   |   On obstacles:
+   |   +-- Needs login -> auto-login with profile test account
+   |   +-- Popup -> auto-dismiss
+   |   +-- Slow page load -> wait
+   |
+   +-- Each step records: step_number, action, status, screenshot
+        |
+        v
+3. Data Verification (triggered after flow completes)
+   +-- UI agent extracts business data from success page (order_id / total / email)
+   +-- Calls verify_in_db(extracted_data) tool
+   |   +-- Spawns independent DB Sub-Agent (new Runner.run, fresh context)
+   |       +-- Injects Network Log (browser mutation API requests + request/response body)
+   |       +-- Injects Form Capture data (traditional form POSTs captured before click)
+   |       +-- Injects Live Schema (real-time describe_table for db_checks tables)
+   |       +-- Injects db_checks verification checklist (if configured in scenario)
+   |       +-- Optional grep_code to look up coded values in the codebase
+   |       +-- Executes SELECT queries to verify each check
+   |       +-- Returns DataVerification JSON array to UI agent
+   +-- UI agent includes results in the report's data_verifications (unmodified)
+        |
+        v
+4. Stuck Detection (StuckDetector, monitors throughout)
+   +-- 3 consecutive identical tool calls -> stuck
+   +-- Last 5 results all identical -> stuck
+   +-- Budget ratio exceeded without report -> stuck
+   -> Auto-switch to Analysis mode: stop tools, synthesize evidence, output report
+        |
+        v
+5. Output Report
+   +-- Terminal: colored table (Steps + Verifications)
+   +-- JSON: full structured report
+   +-- trace.md / trace.jsonl: full execution trace (for debugging)
+   +-- usage summary: LLM token usage stats
+        |
+        v
+6. LessonWriter (independent LLM call)
+   +-- Analyzes this run's steps / issues / next_steps
+   +-- Generates 1 actionable lesson + tags (checkout, p-16227, bank-transfer...)
+   +-- Writes to Memory JSONL -- auto-retrieved for the same scenario next time
 ```
 
 ---
 
-## Memory 系统（RAG）
+## Memory System (RAG)
 
-每次 run 结束后，`LessonWriter` agent 自动提炼一段 actionable lesson 并打上 tags 写入 JSONL。下次运行相同场景时，按 tag 匹配检索，将相关 lesson 注入 system prompt。
+After each run, the `LessonWriter` agent extracts an actionable lesson with tags and writes it to JSONL. On the next run of the same scenario, relevant lessons are retrieved by tag matching and injected into the system prompt.
 
-**Lesson 优先级高于 scenario 步骤**。如果 lesson 说"不要通过 modal 的 View Cart 按钮，直接 navigate 到 /cart"，agent 会跳过 scenario 里对应的步骤。
+**Lessons take priority over scenario steps.** If a lesson says "don't use the modal View Cart button, navigate directly to /cart", the agent will skip the corresponding scenario step.
 
 ```yaml
-# profile 配置
+# Profile config
 memory:
   enabled: true
-  path: "./memory/{project_name}.jsonl"   # {project_name} 自动替换
-  max_entries_in_prompt: 2                 # 每次注入的最大 lesson 数
+  path: "./memory/{project_name}.jsonl"   # {project_name} auto-replaced
+  max_entries_in_prompt: 2                 # max lessons injected per run
 ```
 
 ---
 
-## Token 控制
+## Token Control
 
-Playwright 产品页的完整 ARIA tree 可达 900+ 行 / ~55K chars。`MCPToolOutputFilter` 分两层处理：
+Playwright product pages can produce 900+ line ARIA trees (~55K chars). `MCPToolOutputFilter` handles this in two layers:
 
-| 轮次 | 处理方式 |
-|------|---------|
-| **当前轮（recent）** | 保留完整 interactive ARIA tree（button、link、textbox 等 + ref 节点），模型能看到所有可操作元素 |
-| **历史轮（old turns）** | 丢弃 snapshot ARIA tree，只保留 `### Page`（URL + title），标注 `[snapshot omitted]` |
+| Turn | Strategy |
+|------|----------|
+| **Current turn (recent)** | Keep full interactive ARIA tree (buttons, links, textboxes + refs), model sees all actionable elements |
+| **Old turns** | Drop snapshot ARIA tree, keep only `### Page` (URL + title), mark `[snapshot omitted]` |
 
-历史轮模型只需知道"之前在哪个页面做了什么操作"，不需要看当时页面的全部元素。此策略将 old snapshot 从 ~7,000 tokens/条 降到 ~50 tokens/条，大幅降低长 run 的 TPM 压力。
+Old turns only need "which page, what action" -- not every element on the page. This reduces old snapshots from ~7,000 tokens/each to ~50 tokens/each, significantly lowering TPM pressure on long runs.
 
-**DB Sub-Agent 独立 context**：DB 验证在独立的 `Runner.run()` 里执行，context 从零开始，不携带 UI 流程的任何历史，单次请求仅 ~3-5K tokens。
+**DB Sub-Agent has independent context**: DB verification runs in its own `Runner.run()`, starting from scratch, carrying no UI flow history. A single request is only ~3-5K tokens.
 
-**Rate limit retry**：所有 LLM client 设置 `max_retries=5`，SDK 内部对 429 自动指数退避重试，不重启场景。
+**Rate limit retry**: All LLM clients set `max_retries=5`, SDK handles 429 with automatic exponential backoff, no scenario restart needed.
 
-## DB Schema Cache + Schema Hints
+## Auto-Snapshot
 
-DB Sub-Agent 第一次运行时会调用 `describe_table` 探索表结构，结果自动缓存到本地 JSON 文件：
+`browser_click` and `browser_navigate` may trigger page reloads, making snapshot element refs stale. The system automatically calls `browser_snapshot` after these actions via hooks, injecting fresh refs into the next turn's context to replace stale ones.
+
+The agent prompt relies on auto-snapshot and does **not** require a manual `browser_snapshot` before each click. The agent only calls `browser_snapshot` explicitly when it needs a different depth or the snapshot appears incomplete.
+
+The `MCPToolOutputFilter`'s same-page boundary logic ensures snapshots within the same page URL are not truncated by old-turn compression (e.g. `browser_fill_form` without URL change is treated as the same page).
+
+## Form Capture
+
+Traditional `<form method="POST">` submissions cause full-page navigation. Playwright MCP's `browser_network_requests` only captures fetch/XHR resource types, not document-type navigation requests. This means traditional form POSTs (login forms, newsletter subscriptions, address forms) would be invisible to the DB agent.
+
+**Solution**: Before every `browser_click`, the hooks check if the clicked element is inside a `<form>` using `browser_evaluate`. If yes, all field values are extracted via `FormData` and recorded. These form captures are merged into the network log passed to the DB agent, formatted as:
+
+```
+[POST] https://example.com/newsletter => [form submit]
+  Request body: field1=value1&field2=value2
+```
+
+Form captures go through the same `allowed_domains` filter and are deduplicated against XHR mutations (if the form was also submitted via AJAX, the XHR entry takes precedence).
+
+## Network Log
+
+When the UI agent calls `verify_in_db`, the system automatically fetches the browser's network request log via Playwright MCP, filters it to business API mutations, and injects it into the DB agent's prompt.
+
+The DB agent sees actual API request bodies (e.g. `{"orders_ref": "116NZXM27", "payment_method_id": 5}`), giving it precise field names and values for WHERE conditions.
+
+- **Mutation-only**: Only POST/PUT/PATCH/DELETE requests are kept; GET requests are excluded
+- **Domain filter**: Only requests to `allowed_domains` are kept
+- **Noise filter**: Known third-party / tracking URLs are excluded (Google Analytics, Forter, Facebook, etc.) via `_NOISE_PATTERNS`
+- **Polling dedup**: URLs appearing 4+ times are treated as polling and collapsed
+- **Form capture merge**: Traditional form POST data is appended to the network log
+- **Zero overhead**: UI agent doesn't need to do anything; `verify_in_db` handles it internally
+
+## DB Schema Cache + Live Schema
+
+### Schema Cache
+
+The DB Sub-Agent's first run calls `describe_table` to explore table structures, automatically cached to a local JSON file:
 
 ```
 memory/db_schema_{project_name}.json
 ```
 
-后续运行时，`verify_in_db` 从 cache 中**关键词匹配**相关表（从 UI data + workflow summary + network log 提取关键词），最多注入 20 张表的 schema 到 DB agent prompt。DB agent 直接使用这些表名和列名写 SQL，无需额外 `describe_table` 调用。
+On subsequent runs, `verify_in_db` keyword-matches relevant tables from the cache (using UI data + network log), injecting up to 20 table schemas into the DB agent prompt. Cache is keyed by `database.table` and auto-appends new tables.
 
-Cache 按 `database.table` 为 key 存储，有新表时自动追加。
+### Pre-fetch Schema Cache
 
-### 预抓取 Schema Cache
-
-可以在首次运行前批量抓取所有表结构，避免 DB agent 浪费 turn 做 `describe_table`：
+Batch-fetch all table structures before the first run to avoid wasting DB agent turns on `describe_table`:
 
 ```bash
-# 抓指定数据库的所有表
+# Fetch all tables for a specific database
 uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml -d inkstation
 
-# 增量抓取（跳过已缓存的表）
+# Incremental (skip already cached)
 uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml -d inkstation --skip-cached
 
-# 抓所有数据库（自动跳过 mysql/sys/information_schema/performance_schema）
+# All databases (auto-skips mysql/sys/information_schema/performance_schema)
 uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml
-
-# 自定义输出路径
-uv run python scripts/cache_db_schema.py -p profiles/my_project.yaml -o memory/my_cache.json
 ```
 
-脚本连接 profile 中配置的 DB MCP server，优先使用 `describe_all_tables` 一次性获取整个数据库的全部表结构（1 次调用），如果 MCP server 不支持则自动回退到逐表 `describe_table`。结果写入 `memory/db_schema_{project_name}.json`（与 agent 运行时使用的 cache 文件相同）。多次运行会自动合并，不会覆盖已有缓存。
+### Live Schema (for db_checks)
 
-## Network Log 自动注入
+When `db_checks` are configured, tables referenced in the checks are fetched in real-time via MCP `describe_table` at run time, bypassing the local cache. This ensures the DB agent always sees the latest column definitions even if the schema has changed.
 
-当 UI agent 调用 `verify_in_db` 时，系统自动通过 Playwright MCP 获取浏览器的网络请求日志，过滤出业务 API 的 mutation 请求（POST/PUT/PATCH/DELETE），注入 DB agent 的 prompt。
+## Scenario-Level db_checks
 
-这样 DB agent 可以看到实际的 API 请求体（如 `{"orders_ref": "116NZXM27", "payment_method_id": 5}`），直接知道正确的字段名和表结构映射，无需猜测。
+Profile scenarios can include a DB verification checklist. The DB agent receives this checklist and executes exactly those checks -- no more, no less -- significantly reducing LLM calls.
 
-- **自动过滤**：只保留 `allowed_domains` 内的请求，排除第三方（forter、Google Analytics 等）
-- **零额外开销**：UI agent 不需要做任何事，`verify_in_db` 内部自动获取
-- **传统 Form POST**：不走 fetch/XHR 的页面刷新不会被捕获（这类场景依赖 schema cache）
-
-## Scenario 级 db_checks
-
-Profile 的 scenario 可以配置自然语言的 DB 验证清单。DB agent 收到后直接按清单执行，不再自主探索，大幅减少 LLM 调用。
+### Plain-string format (simple checks)
 
 ```yaml
 scenarios:
@@ -269,81 +297,95 @@ scenarios:
     description: |
       "Test checkout flow..."
     db_checks:
-      - "orders 表中存在该订单，order_total 正确"
-      - "payment_method 为 Bank Transfer"
-      - "orders_status_history 中有对应的状态记录"
-
-  newsletter:
-    description: |
-      "Subscribe Shopping Cart Reminder Email"
-    db_checks:
-      - "customer_newsletter_subscriptions.abandoned_cart 的值是否为1"
+      - "orders table contains the order, order_total is correct"
+      - "payment_method is Bank Transfer"
 ```
 
-没有 `db_checks` 的 scenario 仍走自主发现路线（workflow + network log + schema hints + code grep）。也支持旧格式（纯字符串 scenario），完全向后兼容。
+### Structured format (precise checks with hints)
 
-## Auto-Snapshot
+```yaml
+scenarios:
+  transferGroundToLabel:
+    description: |
+      "Transfer inventory from ground to label..."
+    db_checks:
+      - table: "inkstation_barcode_db.inventory_stock_details"
+        find_by: "type_id=payload.data.type_id, ref_id=payload.data.ref_id, inventory_id=payload.data.inventory_id"
+        verify: "total decreased by payload.totalTransferQty"
+        hint: "use diff_qty from logs to confirm, do NOT infer from current total alone"
 
-`browser_click` 和 `browser_navigate` 触发页面刷新后，snapshot 里的 element refs 会失效。系统通过 hooks 在这两个操作后**自动调用 `browser_snapshot`**，将新鲜的 snapshot 注入下一轮 context，替换过时的 refs。
+      - table: "inkstation_barcode_db.inventory_stock_details"
+        find_by: "type_id=payload.transferTo.inventoryTypeId, ref_id=payload.transferTo.id"
+        verify: "row exists with total increased"
 
-同时，`MCPToolOutputFilter` 的 same-page boundary 逻辑确保**同一页面 URL 下的 snapshot 不会被历史轮截断**（如 fill_form 等无 URL 的操作被视为同一页面）。
+      - table: "inkstation_barcode_db.inventory_stock_details_logs"
+        find_by: "inventory_id from payload, action_type=2, diff_qty=-totalTransferQty"
+        verify: "created_at is recent"
+```
+
+Structured fields:
+
+| Field | Purpose | Required |
+|-------|---------|----------|
+| `table` | Which table to query (auto describe_table) | Yes |
+| `find_by` | WHERE conditions; `payload.*` references network log values | No |
+| `verify` | Expected result -- supports operators like `decreased_by`, `>=` | No |
+| `hint` | Judgment guidance for the DB agent (e.g. which approach to use/avoid) | No |
+
+Both formats can be mixed. Scenarios without `db_checks` still use auto-discovery (network log + schema hints + code grep).
 
 ## DB Verify Memory
 
-DB agent 每次全 pass 后，LLM 自动生成一份结构化的 `.md` 验证知识文档，存储在 `memory/db_verify/{project}/` 下。下次运行时，系统扫描这些文件的 frontmatter，让 LLM 选出最相关的注入 DB agent prompt。
+After the DB agent passes all checks, the LLM auto-generates a structured `.md` knowledge document stored under `memory/db_verify/{project}/`. On subsequent runs, the system scans these files' frontmatter, lets the LLM pick the most relevant one, and injects it into the DB agent prompt.
 
-**Memory 文件内容（全部由 LLM 生成）：**
-- Frontmatter: `name`、`description`、`tags`、`tables`、`confidence`
-- Body: Primary tables（角色 + 关键列）、Common joins、Verification flow（通用占位符，不硬编码值）、Common pitfalls（列名陷阱等）、Table ranking hint、When to reuse
+**Memory file contents (all LLM-generated):**
+- Frontmatter: `name`, `description`, `tags`, `tables`, `confidence`
+- Body: Primary tables (roles + key columns), Common joins, Verification flow (generic placeholders, no hardcoded values), Common pitfalls (column name traps, etc.)
 
-**工作流程：**
+**Workflow:**
 
 ```
-第一次跑 checkout（无 memory）:
-  DB agent 自行探索 → 全 pass
-  → LLM 生成 memory .md 文件（表关系、joins、pitfalls）
-  → 保存到 memory/db_verify/Inkstation_Agent_Testing/checkout_20260402T130646.md
+First checkout run (no memory):
+  DB agent explores on its own -> all pass
+  -> LLM generates memory .md file (table relationships, joins, pitfalls)
+  -> Saved to memory/db_verify/My_Project/checkout_20260402T130646.md
 
-第二次跑 checkout（有 memory）:
-  扫描 memory frontmatter → LLM 选最相关的 → 注入 DB agent prompt
-  → DB agent 看到 "use products_quantity not products_qty"
-  → 直接写对 SQL，零 retry
+Second checkout run (with memory):
+  Scan memory frontmatter -> LLM picks most relevant -> inject into DB agent prompt
+  -> DB agent sees "use products_quantity not products_qty"
+  -> Writes correct SQL on first try, zero retries
 ```
-
-**Live Schema（db_checks 专用）：**
-
-`db_checks` 里提到的表会在运行时通过 MCP `describe_table` 实时获取最新列定义，不依赖本地 cache。确保即使表结构更新了，DB agent 也能看到正确的列名。
 
 ```
 memory/db_verify/
-└── Inkstation_Agent_Testing/          ← 按项目隔离
-    └── checkout_20260402T130646.md    ← LLM 生成的验证知识
++-- My_Project/                       <- isolated per project
+    +-- checkout_20260402T130646.md   <- LLM-generated verification knowledge
 ```
 
 ---
 
-## CLI 参考
+## CLI Reference
 
 ```bash
-# 执行测试场景
+# Execute a test scenario
 test-agent test [OPTIONS]
 
 Options:
-  -p, --profile TEXT     Project Profile YAML 路径（必填）
-  -s, --scenario TEXT    测试场景描述或 profile 中的 scenario 名
-  -o, --output TEXT      报告输出文件路径（默认输出到终端）
-  --max-steps INT        覆盖 profile 中的 max_steps
-  -v, --verbose          显示详细日志
+  -p, --profile TEXT     Project Profile YAML path (required)
+  -s, --scenario TEXT    Test scenario description or named scenario from profile
+  -o, --output TEXT      Report output file path (defaults to terminal)
+  --max-steps INT        Override max_steps from profile
+  -v, --verbose          Enable verbose logging
 
-# 验证 profile
+# Validate a profile
 test-agent validate-profile profiles/my_project.yaml
 ```
 
 ---
 
-## LLM 切换
+## LLM Switching
 
-Profile 的 `model` 字段，一行切换：
+Change the `model` field in your profile:
 
 ```yaml
 # OpenAI
@@ -351,7 +393,7 @@ model:
   provider: "openai"
   model_name: "gpt-4o"
 
-# Gemini（有免费额度）
+# Gemini (free tier available)
 model:
   provider: "gemini"
   model_name: "gemini-2.0-flash"
@@ -366,7 +408,7 @@ model:
   provider: "groq"
   model_name: "llama-3.3-70b-versatile"
 
-# 任意 OpenAI 兼容 API
+# Any OpenAI-compatible API
 model:
   provider: "custom"
   model_name: "your-model"
@@ -374,46 +416,46 @@ model:
   api_key_env: "YOUR_API_KEY"
 ```
 
-对应的环境变量自动查找（`GEMINI_API_KEY`、`OPENAI_API_KEY` 等），也可通过 `api_key_env` 显式指定。
+API keys are auto-detected by provider (`GEMINI_API_KEY`, `OPENAI_API_KEY`, etc.), or explicitly set via `api_key_env`.
 
 ---
 
-## Profile 完整参考
+## Full Profile Reference
 
 ```yaml
 project:
-  name: "项目名"                              # 必填
-  description: "项目简介"
+  name: "Project Name"                          # required
+  description: "Project description"
 
 # --- LLM ---
 model:
-  provider: "openai"                          # openai | gemini | deepseek | groq | custom
+  provider: "openai"                            # openai | gemini | deepseek | groq | custom
   model_name: "gpt-4o"
-  api_key_env: "OPENAI_API_KEY"              # 不填则自动按 provider 查找
-  base_url: null                              # 自定义端点（custom provider 用）
+  api_key_env: "OPENAI_API_KEY"                # auto-detected by provider if omitted
+  base_url: null                                # custom endpoint (for custom provider)
 
-# --- 环境 ---
+# --- Environment ---
 environment:
   type: "web"
   base_url: "https://staging.example.com"
-  start_command: "npm run dev"               # 可选，本地启动命令
-  health_check_url: "/api/health"            # 可选
+  start_command: "npm run dev"                 # optional, local start command
+  health_check_url: "/api/health"              # optional
 
-# --- 认证 ---
+# --- Auth ---
 auth:
-  method: "form"                              # form | token | cookie | none
+  method: "form"                                # form | token | cookie | none
   login_url: "/login"
   test_accounts:
     - role: "admin"
-      username_env: "TEST_ADMIN_USER"        # 环境变量名（不是明文密码）
+      username_env: "TEST_ADMIN_USER"          # env var name (not plaintext password)
       password_env: "TEST_ADMIN_PASS"
     - role: "user"
       username_env: "TEST_USER_USER"
       password_env: "TEST_USER_PASS"
 
-# --- 代码 ---
+# --- Code ---
 code:
-  root_dir: "/absolute/path/to/project"      # 必填，本地 repo 绝对路径
+  root_dir: "/absolute/path/to/project"        # required, local repo absolute path
   branch: "main"
   entry_dirs:
     - "src/pages"
@@ -421,22 +463,22 @@ code:
   config_files:
     - ".env.staging"
 
-# --- 记忆 ---
+# --- Memory ---
 memory:
   enabled: true
-  path: "./memory/{project_name}.jsonl"      # {project_name} 自动替换
-  max_entries_in_prompt: 2                   # 注入 prompt 的最大 lesson 数
+  path: "./memory/{project_name}.jsonl"        # {project_name} auto-replaced
+  max_entries_in_prompt: 2                     # max lessons injected per run
 
-# --- MCP 服务 ---
+# --- MCP Servers ---
 mcp_servers:
   playwright:
     enabled: true
     command: "npx"
     args: ["@playwright/mcp@latest", "--browser", "chromium", "--timeout-action", "15000"]
-    cwd: "./artifacts/playwright"            # snapshot/截图输出目录
+    cwd: "./artifacts/playwright"              # snapshot/screenshot output directory
     cache_tools_list: true
-    client_session_timeout_seconds: 30       # 必须 > timeout-action / 1000
-    allowed_tools:                           # 限制 agent 可用的 browser 工具
+    client_session_timeout_seconds: 30         # must be > timeout-action / 1000
+    allowed_tools:                             # restrict browser tools available to agent
       - browser_navigate
       - browser_snapshot
       - browser_click
@@ -447,9 +489,10 @@ mcp_servers:
       - browser_handle_dialog
       - browser_wait_for
       - browser_take_screenshot
+      - browser_network_requests
   database:
     enabled: true
-    role: database                              # 标记为 DB server，路由给 DB Sub-Agent
+    role: database                              # marks as DB server, routed to DB Sub-Agent
     command: "node"
     args: ["./mcp-servers/db-mcp/index.js"]
     env:
@@ -458,98 +501,113 @@ mcp_servers:
       DB_PORT_ENV: "DB_PORT"
       DB_USER_ENV: "DB_USER"
       DB_PASSWORD_ENV: "DB_PASSWORD"
-# --- 边界 ---
+      DB_ALIASES_ENV: "DB_ALIASES"             # optional, database name aliasing
+
+# --- Boundaries ---
 boundaries:
   readonly: true
-  forbidden_actions:                          # SQL 黑名单
+  forbidden_actions:                            # SQL blocklist
     - "DELETE FROM"
     - "DROP TABLE"
     - "INSERT INTO"
     - "UPDATE"
   max_steps: 40
   max_turns: 20
-  stuck_budget_ratio: 0.85                    # 超过该比例仍无报告则切 Analysis 模式
+  stuck_budget_ratio: 0.85                      # switch to Analysis mode above this ratio
   allowed_domains:
     - "staging.example.com"
 
-# --- 预定义 scenario（可选）---
+# --- Predefined Scenarios (optional) ---
 scenarios:
-  # 简单格式（纯描述）
+  # Simple format (plain description)
   login: |
     Test login flow with valid and invalid credentials.
 
-  # 结构化格式（带 DB 验证清单）
+  # Structured format with DB verification checklist
   checkout:
     description: |
       Add product to cart and complete checkout via Bank Transfer.
-    db_checks:                                 # 可选，自然语言验证项
-      - "orders 表中存在该订单，order_total 正确"
-      - "payment_method 为 Bank Transfer"
+    db_checks:
+      - "orders table contains the order, order_total is correct"
+      - "payment_method is Bank Transfer"
+
+  # Structured db_checks with table/find_by/verify/hint
+  transfer:
+    description: |
+      Transfer inventory from ground to label.
+    db_checks:
+      - table: "warehouse_db.inventory_stock_details"
+        find_by: "type_id=payload.data.type_id, ref_id=payload.data.ref_id"
+        verify: "total decreased by payload.totalTransferQty"
+        hint: "use logs diff_qty to confirm"
 ```
 
 ---
 
-## 项目结构
+## Project Structure
 
 ```
 src/universal_debug_agent/
-├── main.py                  # CLI 入口 (typer) — test / validate-profile
-├── config.py                # YAML Profile 加载
-├── schemas/
-│   ├── profile.py           # ProjectProfile + ScenarioConfig + ModelConfig + BoundariesConfig 等
-│   └── report.py            # ScenarioReport + ScenarioStep + DataVerification
-├── agents/
-│   ├── brain.py             # create_brain_agent（ReAct + Analysis 模式）
-│   ├── db_agent.py          # DB Sub-Agent（verify_in_db 工具内部调用）
-│   └── prompts.py           # System prompts（ReAct + Analysis 双模式）
-├── orchestrator/
-│   ├── state_machine.py     # InvestigationOrchestrator + StuckDetector
-│   ├── hooks.py             # InvestigationHooks：tool 监控、auto-snapshot、卡住检测
-│   └── input_filters.py     # MCPToolOutputFilter：
-│                            #   current turn → 完整 interactive ARIA tree
-│                            #   old turns    → snapshot 全删，只留 URL/title
-│                            #   same-page boundary → 同 URL 下不截断 snapshot
-├── models/
-│   └── factory.py           # LLM 工厂（OpenAI/Gemini/DeepSeek/...）
-├── memory/
-│   ├── store.py             # JSONL 存储：tag 倒排索引 + 场景相似度检索
-│   └── lesson.py            # LessonWriter：run 结束后提炼 lesson + tags
-├── observability/
-│   ├── llm_usage.py         # per-run token 用量统计（JSONL）
-│   └── trace_recorder.py    # 执行轨迹落盘（trace.md + trace.jsonl）
-├── mcp/
-│   └── factory.py           # MCP server 工厂（Playwright + DB）
-└── tools/
-    ├── auth_tools.py        # get_test_account(role) — 从 profile 读测试账号
-    ├── code_tools.py        # read_file / grep_code / list_directory（沙箱化）
-    ├── db_tool.py           # verify_in_db — 触发 DB Sub-Agent；管理 schema cache；
-    │                        #   自动获取 network log + workflow summary + schema hints
-    └── report_tool.py       # submit_report — 结构化报告提交，退出 ReAct 循环
++-- main.py                  # CLI entry point (typer) -- test / validate-profile
++-- config.py                # YAML Profile loading
++-- schemas/
+|   +-- profile.py           # ProjectProfile + ScenarioConfig + DBCheck + ModelConfig + BoundariesConfig
+|   +-- report.py            # ScenarioReport + ScenarioStep + DataVerification
++-- agents/
+|   +-- brain.py             # create_brain_agent (ReAct + Analysis modes)
+|   +-- db_agent.py          # DB Sub-Agent (called inside verify_in_db tool)
+|   +-- prompts.py           # System prompts (ReAct + Analysis dual-mode)
++-- orchestrator/
+|   +-- state_machine.py     # InvestigationOrchestrator + StuckDetector
+|   +-- hooks.py             # InvestigationHooks: tool monitoring, auto-snapshot,
+|   |                        #   form capture (browser_evaluate before click),
+|   |                        #   stuck detection, trace recording
+|   +-- input_filters.py     # MCPToolOutputFilter:
+|                            #   current turn -> full interactive ARIA tree
+|                            #   old turns    -> snapshot dropped, URL/title only
+|                            #   same-page boundary -> don't truncate within same URL
++-- models/
+|   +-- factory.py           # LLM factory (OpenAI/Gemini/DeepSeek/...)
++-- memory/
+|   +-- store.py             # JSONL storage: tag inverted index + scenario similarity search
+|   +-- lesson.py            # LessonWriter: extract lesson + tags after run
++-- observability/
+|   +-- llm_usage.py         # Per-run token usage stats (JSONL)
+|   +-- trace_recorder.py    # Execution trace to disk (trace.md + trace.jsonl)
++-- mcp/
+|   +-- factory.py           # MCP server factory (Playwright + DB)
++-- tools/
+    +-- auth_tools.py        # get_test_account(role) -- read test accounts from profile
+    +-- code_tools.py        # read_file / grep_code / list_directory (sandboxed)
+    +-- db_tool.py           # verify_in_db -- spawns DB Sub-Agent; manages schema cache;
+    |                        #   auto-fetches network log + form captures + live schema
+    +-- report_tool.py       # submit_report -- structured report submission, exits ReAct loop
 ```
 
 ---
 
-## V1 边界
+## V1 Scope
 
-| 做 | 不做 |
-|---|---|
-| 执行任意业务流程（Playwright） | 自动改代码 |
-| 数据验证（DB 只读查询） | 写数据库 |
-| Scenario 级 db_checks 精确验证 | 自动提 PR |
-| Auto-snapshot + same-page boundary | 解 CAPTCHA / 2FA |
-| Network log + workflow summary 自动注入 DB agent | 无限制浏览外部域名 |
-| 自动处理登录/弹窗等障碍 | |
-| 读本地代码辅助理解 | |
-| 结构化 pass/fail 报告 | |
-| JSONL 测试记忆 + RAG lesson 检索 | |
-| 多 LLM provider 切换 | |
+| In Scope | Out of Scope |
+|----------|--------------|
+| Execute any business flow (Playwright) | Auto-modify code |
+| Data verification (DB read-only queries) | Write to database |
+| Scenario-level db_checks (plain + structured) | Auto-create PRs |
+| Auto-snapshot + same-page boundary | Solve CAPTCHA / 2FA |
+| Form capture for traditional POST submissions | Unlimited external domain browsing |
+| Network log + form data auto-injection to DB agent | |
+| Auto-handle login / popup / loading | |
+| Read local code to assist understanding | |
+| Structured pass/fail reports | |
+| JSONL test memory + RAG lesson retrieval | |
+| Multi-LLM provider switching | |
 
 ## Roadmap
 
-- **V2**: Contract 固化 — LLM 第一次探索后生成验证 contract，后续确定性复用，无需每次 ReAct
-- **V3**: 多 agent 并行执行 + 智能测试策略生成
+- **V2**: Contract solidification -- LLM explores once, generates verification contract, deterministic reuse afterwards (no ReAct needed per run)
+- **V3**: Multi-agent parallel execution + intelligent test strategy generation
 
-详见 [docs/PLAN_V1.md](docs/PLAN_V1.md) | [docs/PLAN_V2.md](docs/PLAN_V2.md) | [docs/PLAN_V3.md](docs/PLAN_V3.md)。
+See [docs/PLAN_V1.md](docs/PLAN_V1.md) | [docs/PLAN_V2.md](docs/PLAN_V2.md) | [docs/PLAN_V3.md](docs/PLAN_V3.md).
 
 ## License
 
