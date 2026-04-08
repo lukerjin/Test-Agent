@@ -169,7 +169,7 @@ class InvestigationOrchestrator:
         memory_context: str = "",
         usage_tracker: LLMUsageTracker | None = None,
         trace_recorder: ExecutionTraceRecorder | None = None,
-        db_checks: list[str] | None = None,
+        db_checks: list[str | Any] | None = None,
         scenario_name: str | None = None,
     ):
         self.profile = profile

@@ -8,7 +8,15 @@ import re
 from pathlib import Path
 from typing import Any
 
-from agents import Agent, RunContextWrapper, RunHooks, Runner, RunConfig, Tool, function_tool
+from agents import (
+    Agent,
+    RunConfig,
+    RunContextWrapper,
+    RunHooks,
+    Runner,
+    Tool,
+    function_tool,
+)
 from agents.mcp import MCPServerStdio
 
 from universal_debug_agent.agents.db_agent import DB_MAX_TURNS, DBVerificationOutput
@@ -54,9 +62,11 @@ _playwright_server: MCPServerStdio | None = None
 _allowed_domains: list[str] = []
 _code_root_dir: str = ""
 _usage_tracker: Any = None  # LLMUsageTracker instance
-_db_checks: list[str] = []  # Scenario-specific verification hints
+_db_checks: list = []  # Scenario-specific verification hints (str or DBCheck)
 _scenario_name: str | None = None  # For DB verify memory
-_captured_form_data: list[dict] = []  # Form data captured by hooks before traditional form submits
+_captured_form_data: list[
+    dict
+] = []  # Form data captured by hooks before traditional form submits
 
 
 def record_form_capture(data: dict) -> None:
@@ -79,11 +89,21 @@ def configure(
     evidence_collector: Any = None,
     code_root_dir: str = "",
     usage_tracker: Any = None,
-    db_checks: list[str] | None = None,
+    db_checks: list | None = None,
     scenario_name: str | None = None,
 ) -> None:
     """Configure the DB tool. Call this before running the UI agent."""
-    global _db_mcp_servers, _model, _trace_recorder, _cache_path, _playwright_server, _allowed_domains, _code_root_dir, _usage_tracker, _db_checks, _scenario_name
+    global \
+        _db_mcp_servers, \
+        _model, \
+        _trace_recorder, \
+        _cache_path, \
+        _playwright_server, \
+        _allowed_domains, \
+        _code_root_dir, \
+        _usage_tracker, \
+        _db_checks, \
+        _scenario_name
     _db_mcp_servers = db_mcp_servers
     _model = model
     _trace_recorder = trace_recorder
@@ -105,7 +125,6 @@ def _db_verify_memory_dir() -> Path | None:
     return _cache_path.parent / "db_verify" / project_slug
 
 
-
 def _build_schema_index(cache: dict | None = None) -> tuple[dict[str, str], set[str]]:
     """Return cached table -> database mapping and known database names."""
     if cache is None:
@@ -123,15 +142,29 @@ def _build_schema_index(cache: dict | None = None) -> tuple[dict[str, str], set[
     return table_to_db, databases
 
 
-def _extract_db_check_tables(db_checks: list[str] | None, cache: dict | None = None) -> list[str]:
-    """Extract only explicit table names referenced in db_checks text.
+def _db_check_to_text(check) -> str:
+    """Convert a db_check item (str or DBCheck) to its text representation."""
+    if isinstance(check, str):
+        return check
+    # Structured DBCheck object
+    parts = [f"Table: {check.table}"]
+    if check.find_by:
+        parts.append(f"Find by: {check.find_by}")
+    if check.verify:
+        parts.append(f"Verify: {check.verify}")
+    if check.hint:
+        parts.append(f"IMPORTANT: {check.hint}")
+    return "\n".join(parts)
 
-    db_checks are verification goals, not free-form schema discovery hints. We
-    only trust names that map exactly to known cached tables, including forms
-    like:
-    - ``orders``
-    - ``orders_total.value``  -> table ``orders_total``
-    - ``warehouse.orders``    -> table ``orders``
+
+def _extract_db_check_tables(
+    db_checks: list | None, cache: dict | None = None
+) -> list[str]:
+    """Extract only explicit table names referenced in db_checks.
+
+    Supports both plain-string checks and structured DBCheck objects.
+    For structured checks, reads the ``table`` field directly.
+    For plain strings, uses regex to find known table names.
     """
     if not db_checks:
         return []
@@ -150,6 +183,24 @@ def _extract_db_check_tables(db_checks: list[str] | None, cache: dict | None = N
             found.append(table)
 
     for check in db_checks:
+        # Structured DBCheck: read table field directly
+        if not isinstance(check, str):
+            table_val = check.table.lower()
+            # Handle db.table format
+            if "." in table_val:
+                parts = table_val.split(".")
+                for p in parts:
+                    _remember(p)
+            else:
+                _remember(table_val)
+            # Also scan find_by/verify for table references
+            extra_text = f"{check.find_by} {check.verify} {check.hint}".lower()
+            for dotted in re.findall(r"([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)", extra_text):
+                for p in dotted.split("."):
+                    _remember(p)
+            continue
+
+        # Plain string: regex extraction
         lowered = check.lower()
 
         # Dot-qualified references: db.table, table.column, db.table.column
@@ -171,7 +222,6 @@ def _extract_db_check_tables(db_checks: list[str] | None, cache: dict | None = N
     return found
 
 
-
 def _get_model_client():
     """Extract AsyncOpenAI client and model name from the configured _model.
 
@@ -186,6 +236,7 @@ def _get_model_client():
     # Native OpenAI: _model is a string like "gpt-4o"
     if isinstance(_model, str):
         import httpx
+
         return AsyncOpenAI(timeout=httpx.Timeout(30.0, connect=5.0)), _model
 
     # OpenAIChatCompletionsModel: stores client as ._client, model name as .model
@@ -195,7 +246,6 @@ def _get_model_client():
         return client, model_name
 
     return None, None
-
 
 
 async def _save_db_verify_memory(verifications: list[dict]) -> None:
@@ -220,7 +270,9 @@ async def _save_db_verify_memory(verifications: list[dict]) -> None:
         return
 
     client, model_name = _get_model_client()
-    logger.info(f"[db] memory save: all_pass=True, client={'yes' if client else 'None'}, model={model_name}")
+    logger.info(
+        f"[db] memory save: all_pass=True, client={'yes' if client else 'None'}, model={model_name}"
+    )
 
     # Build verification summary for LLM
     checks_text = ""
@@ -310,6 +362,7 @@ CRITICAL: Do NOT hardcode specific values from this run (order IDs, amounts, pro
         return
 
     from datetime import datetime
+
     now = datetime.now().isoformat(timespec="seconds")
 
     # LLM generates full frontmatter + body. Inject `updated` timestamp.
@@ -369,7 +422,12 @@ async def _fetch_network_log() -> str:
     try:
         result = await _playwright_server.call_tool(
             "browser_network_requests",
-            {"requestBody": True, "responseBody": True, "requestHeaders": False, "static": False},
+            {
+                "requestBody": True,
+                "responseBody": True,
+                "requestHeaders": False,
+                "static": False,
+            },
         )
     except Exception as e:
         logger.warning(f"[db] failed to fetch network log: {e}")
@@ -382,13 +440,23 @@ async def _fetch_network_log() -> str:
 
     # Known third-party paths / domains to exclude from network log
     _NOISE_PATTERNS = (
-        "/forter/", "forter.com",
-        "google.com/", "google.com.au/",
-        "googleads.", "googlesyndication.",
-        "/tracking", "/collect", "/log",
-        "/ccm/collect", "/rmkt/collect",
-        "facebook.com", "facebook.net",
-        "analytics", "gtag", "gtm",
+        "/forter/",
+        "forter.com",
+        "google.com/",
+        "google.com.au/",
+        "googleads.",
+        "googlesyndication.",
+        "/tracking",
+        "/collect",
+        "/log",
+        "/ccm/collect",
+        "/rmkt/collect",
+        "facebook.com",
+        "facebook.net",
+        "analytics",
+        "gtag",
+        "gtm",
+        "/ui-perms",
     )
 
     # Filter to mutation requests (POST/PUT/PATCH/DELETE), skip third-party noise
@@ -397,14 +465,19 @@ async def _fetch_network_log() -> str:
     last_was_mutation = False
     for line in raw.splitlines():
         line_stripped = line.strip()
-        if any(line_stripped.startswith(f"[{m}]") for m in ("POST", "PUT", "PATCH", "DELETE")):
+        if any(
+            line_stripped.startswith(f"[{m}]")
+            for m in ("POST", "PUT", "PATCH", "DELETE")
+        ):
             # Skip known third-party / tracking requests
             lower = line_stripped.lower()
             if any(p in lower for p in _NOISE_PATTERNS):
                 last_was_mutation = False
                 continue
             # Domain filter: only keep requests to our app's domains
-            if _allowed_domains and not any(d in line_stripped for d in _allowed_domains):
+            if _allowed_domains and not any(
+                d in line_stripped for d in _allowed_domains
+            ):
                 last_was_mutation = False
                 continue
             # Count URL occurrences for polling detection
@@ -412,7 +485,10 @@ async def _fetch_network_log() -> str:
             mutations.append(line_stripped)
             last_was_mutation = True
         # Keep "Request body:" and "Response body:" lines that follow a kept mutation request
-        elif (line_stripped.startswith("Request body:") or line_stripped.startswith("Response body:")) and last_was_mutation:
+        elif (
+            line_stripped.startswith("Request body:")
+            or line_stripped.startswith("Response body:")
+        ) and last_was_mutation:
             mutations.append("  " + line_stripped)
         else:
             last_was_mutation = False
@@ -434,7 +510,9 @@ async def _fetch_network_log() -> str:
             skip_body = False
             filtered.append(m)
         mutations = filtered
-        logger.info(f"[db] filtered {len(polling_urls)} high-frequency polling URLs from network log")
+        logger.info(
+            f"[db] filtered {len(polling_urls)} high-frequency polling URLs from network log"
+        )
 
     if not mutations and not _captured_form_data:
         return ""
@@ -634,7 +712,9 @@ async def _describe_db_checks_tables() -> str:
         if not database:
             continue
         try:
-            result = await server.call_tool("describe_table", {"database": database, "table": table})
+            result = await server.call_tool(
+                "describe_table", {"database": database, "table": table}
+            )
             raw = _serialize_tool_result(getattr(result, "content", result))
             if raw and "Error" not in raw:
                 parsed = _parse_describe_result(raw)
@@ -674,14 +754,18 @@ async def verify_in_db(data_json: str) -> str:
     from universal_debug_agent.agents.db_agent import create_db_agent
 
     if not _db_mcp_servers:
-        return json.dumps([{
-            "check_name": "DB verification",
-            "query": "",
-            "expected": "",
-            "actual": "DB tool not configured — no database MCP server available",
-            "status": "blocked",
-            "severity": "high",
-        }])
+        return json.dumps(
+            [
+                {
+                    "check_name": "DB verification",
+                    "query": "",
+                    "expected": "",
+                    "actual": "DB tool not configured — no database MCP server available",
+                    "status": "blocked",
+                    "severity": "high",
+                }
+            ]
+        )
 
     # No db_checks → skip DB verification entirely
     if not _db_checks:
@@ -703,7 +787,9 @@ async def verify_in_db(data_json: str) -> str:
     if network_log:
         logger.info(f"[db] injecting network log ({len(network_log)} chars)")
     if live_schema:
-        logger.info(f"[db] injecting live schema for db_checks tables ({len(live_schema)} chars)")
+        logger.info(
+            f"[db] injecting live schema for db_checks tables ({len(live_schema)} chars)"
+        )
     logger.info(f"[db] injecting {len(_db_checks)} verification checks from scenario")
 
     # Record everything passed to DB agent in the trace for debugging
@@ -744,11 +830,15 @@ async def verify_in_db(data_json: str) -> str:
         return json.dumps(verifications, default=str)
     except Exception as e:
         logger.error(f"[db] DB agent error: {e}")
-        return json.dumps([{
-            "check_name": "DB verification",
-            "query": "",
-            "expected": "",
-            "actual": f"DB agent error: {e}",
-            "status": "blocked",
-            "severity": "high",
-        }])
+        return json.dumps(
+            [
+                {
+                    "check_name": "DB verification",
+                    "query": "",
+                    "expected": "",
+                    "actual": f"DB agent error: {e}",
+                    "status": "blocked",
+                    "severity": "high",
+                }
+            ]
+        )
