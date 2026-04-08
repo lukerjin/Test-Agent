@@ -1,12 +1,13 @@
-"""Claude Code CLI executor — runs UI test scenarios via Claude Code CLI.
+"""Claude Code CLI executor — runs the full test pipeline via Claude Code CLI.
 
-Replaces the Brain Agent + OpenAI Agents SDK loop with a single Claude Code
-CLI invocation. Claude Code handles context management, Playwright MCP, and
-obstacle handling internally.
+All LLM work (UI execution, DB verification, lesson generation) goes through
+``claude -p`` so that choosing ``execution_mode=cli`` never touches the OpenAI
+Agents SDK.
 
 Architecture:
-    Orchestrator → claude_executor.run_scenario_cli() → claude -p "..." → parse result
-    Then: orchestrator runs DB verification separately using existing db_tool.
+    Orchestrator → run_scenario_cli()    → claude -p + Playwright MCP → CLIResult
+                 → verify_db_cli()       → claude -p + DB MCP        → list[dict]
+                 → generate_lesson_cli() → claude -p (no MCP)        → (lesson, tags)
 """
 
 from __future__ import annotations
@@ -14,12 +15,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import re
 import shutil
+import tempfile
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from universal_debug_agent.schemas.profile import ProjectProfile, DBCheckItem
+from universal_debug_agent.mcp.factory import _resolve_env
 from universal_debug_agent.schemas.report import (
     DataVerification,
     ScenarioReport,
@@ -71,7 +77,6 @@ def _build_cli_prompt(
         parts.append(f"Login URL: {profile.auth.login_url}")
         parts.append(f"Method: {profile.auth.method}")
         if profile.auth.test_accounts:
-            import os
             for acct in profile.auth.test_accounts:
                 username = os.environ.get(acct.username_env, acct.username_env)
                 password = os.environ.get(acct.password_env, acct.password_env)
@@ -138,8 +143,6 @@ def _parse_cli_output(raw: str) -> CLIResult:
     json_str = None
 
     # Look for ```json ... ``` block first
-    import re
-
     json_match = re.search(r"```json\s*\n(.*?)\n```", raw, re.DOTALL)
     if json_match:
         json_str = json_match.group(1)
@@ -186,81 +189,390 @@ def _parse_cli_output(raw: str) -> CLIResult:
     )
 
 
-async def run_scenario_cli(
-    scenario: str,
-    profile: ProjectProfile,
-    db_checks: list[DBCheckItem] | None = None,
-    timeout_seconds: int = 300,
-) -> CLIResult:
-    """Execute a UI test scenario via Claude Code CLI.
+def _build_mcp_config(profile: ProjectProfile) -> dict:
+    """Build a Claude Code --mcp-config JSON from the profile's mcp_servers.
 
-    Args:
-        scenario: Natural language test scenario description.
-        profile: Project profile with auth, boundaries, etc.
-        db_checks: Optional DB checks (used to guide data extraction).
-        timeout_seconds: Max time for CLI execution (default 5 minutes).
+    Only includes the Playwright server (role != "database") since DB
+    verification runs separately via db_tool.
+    """
+    servers: dict[str, Any] = {}
+    for name, config in profile.mcp_servers.items():
+        if not config.enabled:
+            continue
+        # Skip DB servers — DB verification runs separately
+        if config.role == "database":
+            continue
 
-    Returns:
-        CLIResult with extracted data, steps, and success status.
+        server_def: dict[str, Any] = {
+            "command": config.command,
+            "args": config.args,
+        }
+        if config.env:
+            server_def["env"] = _resolve_env(config.env)
+
+        # Resolve cwd (mirrors factory._resolve_cwd logic for playwright)
+        cwd = config.cwd
+        if not cwd and name == "playwright":
+            cwd = "./artifacts/playwright"
+        if cwd:
+            path = Path(cwd).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            if name == "playwright":
+                timestamp = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+                path = path / timestamp
+            path.mkdir(parents=True, exist_ok=True)
+            server_def["cwd"] = str(path.resolve())
+
+        servers[name] = server_def
+
+    return {"mcpServers": servers}
+
+
+def _build_mcp_config_for_db(profile: ProjectProfile) -> dict:
+    """Build MCP config containing only the DB server(s)."""
+    servers: dict[str, Any] = {}
+    for name, config in profile.mcp_servers.items():
+        if not config.enabled:
+            continue
+        is_db = config.role == "database" or (
+            config.role is None and "database" in name.lower()
+        )
+        if not is_db:
+            continue
+
+        server_def: dict[str, Any] = {
+            "command": config.command,
+            "args": config.args,
+        }
+        if config.env:
+            server_def["env"] = _resolve_env(config.env)
+        if config.cwd:
+            path = Path(config.cwd).expanduser()
+            if not path.is_absolute():
+                path = Path.cwd() / path
+            path.mkdir(parents=True, exist_ok=True)
+            server_def["cwd"] = str(path.resolve())
+
+        servers[name] = server_def
+
+    return {"mcpServers": servers}
+
+
+# ---------------------------------------------------------------------------
+# Shared CLI runner
+# ---------------------------------------------------------------------------
+
+async def _run_claude_cli(
+    prompt: str,
+    *,
+    mcp_config: dict | None = None,
+    allowed_tools: str | None = None,
+    timeout_seconds: int = 600,
+    label: str = "cli",
+) -> tuple[str, str, int]:
+    """Run ``claude -p`` and return (stdout, stderr, returncode).
+
+    Streams stderr lines via logger in real-time.
     """
     claude_path = shutil.which("claude")
     if not claude_path:
-        return CLIResult(
-            success=False,
-            error="Claude Code CLI not found. Install it: npm install -g @anthropic-ai/claude-code",
+        raise FileNotFoundError(
+            "Claude Code CLI not found. Install: npm install -g @anthropic-ai/claude-code"
         )
-
-    prompt = _build_cli_prompt(scenario, profile, db_checks)
-    logger.info(f"[cli] executing scenario via Claude Code CLI ({len(prompt)} chars prompt)")
 
     cmd = [
         claude_path,
         "-p", prompt,
         "--output-format", "text",
         "--verbose",
+        "--dangerously-skip-permissions",
     ]
-
-    # Add allowed tools for Playwright
-    cmd.extend(["--allowedTools", "mcp__playwright__*"])
+    mcp_config_file = None
 
     try:
+        if mcp_config and mcp_config.get("mcpServers"):
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".json", prefix="mcp_config_", delete=False
+            ) as f:
+                json.dump(mcp_config, f)
+                mcp_config_file = f.name
+            cmd.extend(["--mcp-config", mcp_config_file])
+            logger.info(
+                f"[{label}] MCP config: {list(mcp_config['mcpServers'].keys())}"
+            )
+
+        if allowed_tools:
+            cmd.extend(["--allowedTools", allowed_tools])
+
         proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
 
-        stdout_bytes, stderr_bytes = await asyncio.wait_for(
-            proc.communicate(),
-            timeout=timeout_seconds,
-        )
+        async def _stream_stderr() -> str:
+            lines: list[str] = []
+            assert proc.stderr is not None
+            async for raw_line in proc.stderr:
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                lines.append(line)
+                logger.info(f"[{label}] {line}")
+            return "\n".join(lines)
 
-        stdout = stdout_bytes.decode("utf-8", errors="replace")
-        stderr = stderr_bytes.decode("utf-8", errors="replace")
+        async def _collect_stdout() -> str:
+            assert proc.stdout is not None
+            data = await proc.stdout.read()
+            return data.decode("utf-8", errors="replace")
 
-        if proc.returncode != 0:
-            logger.warning(f"[cli] Claude Code CLI returned non-zero: {proc.returncode}")
-            logger.warning(f"[cli] stderr: {stderr[:500]}")
-            return CLIResult(
-                success=False,
-                error=f"CLI exited with code {proc.returncode}: {stderr[:500]}",
-                raw_output=stdout,
+        try:
+            stderr, stdout, rc = await asyncio.wait_for(
+                asyncio.gather(_stream_stderr(), _collect_stdout(), proc.wait()),
+                timeout=timeout_seconds,
             )
-
-        logger.info(f"[cli] CLI completed, output: {len(stdout)} chars")
-        return _parse_cli_output(stdout)
-
-    except asyncio.TimeoutError:
-        logger.error(f"[cli] CLI timed out after {timeout_seconds}s")
-        if proc:
+        except asyncio.TimeoutError:
             proc.kill()
+            await proc.wait()
+            raise
+
+        return stdout, stderr, rc
+
+    finally:
+        if mcp_config_file and os.path.exists(mcp_config_file):
+            os.unlink(mcp_config_file)
+
+
+def _extract_json(raw: str) -> dict | list | None:
+    """Extract the first JSON object or array from CLI text output."""
+    m = re.search(r"```json\s*\n(.*?)\n```", raw, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except json.JSONDecodeError:
+            pass
+
+    # Fallback: find last top-level { ... } or [ ... ]
+    brace_depth = 0
+    start = -1
+    end = -1
+    for i, ch in enumerate(raw):
+        if ch in "{[":
+            if brace_depth == 0:
+                start = i
+            brace_depth += 1
+        elif ch in "}]":
+            brace_depth -= 1
+            if brace_depth == 0 and start >= 0:
+                end = i + 1
+    if start >= 0 and end > start:
+        try:
+            return json.loads(raw[start:end])
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+async def run_scenario_cli(
+    scenario: str,
+    profile: ProjectProfile,
+    db_checks: list[DBCheckItem] | None = None,
+    timeout_seconds: int = 600,
+) -> CLIResult:
+    """Execute a UI test scenario via Claude Code CLI."""
+    prompt = _build_cli_prompt(scenario, profile, db_checks)
+    logger.info(f"[cli-ui] executing scenario ({len(prompt)} chars prompt)")
+
+    try:
+        stdout, stderr, rc = await _run_claude_cli(
+            prompt,
+            mcp_config=_build_mcp_config(profile),
+            allowed_tools="mcp__playwright__*",
+            timeout_seconds=timeout_seconds,
+            label="cli-ui",
+        )
+    except FileNotFoundError as e:
+        return CLIResult(success=False, error=str(e))
+    except asyncio.TimeoutError:
         return CLIResult(
             success=False,
             error=f"CLI timed out after {timeout_seconds} seconds",
         )
     except Exception as e:
-        logger.error(f"[cli] CLI execution error: {e}")
         return CLIResult(success=False, error=str(e))
+
+    if rc != 0:
+        return CLIResult(
+            success=False,
+            error=f"CLI exited with code {rc}: {stderr[-500:]}",
+            raw_output=stdout,
+        )
+
+    logger.info(f"[cli-ui] completed, output: {len(stdout)} chars")
+    return _parse_cli_output(stdout)
+
+
+# ---------------------------------------------------------------------------
+# DB verification via CLI
+# ---------------------------------------------------------------------------
+
+def _build_db_verify_prompt(
+    data_json: str,
+    db_checks: list[DBCheckItem],
+    live_schema: str = "",
+    network_log: str = "",
+) -> str:
+    """Build a prompt for DB verification via Claude Code CLI."""
+    parts = [
+        "You are a database verification agent.",
+        "",
+        "## Verification checklist",
+    ]
+    for i, check in enumerate(db_checks, 1):
+        if isinstance(check, str):
+            parts.append(f"  {i}. {check}")
+        else:
+            parts.append(f"  {i}. Table: {check.table} — find_by: {check.find_by}, verify: {check.verify}")
+            if check.hint:
+                parts.append(f"     Hint: {check.hint}")
+
+    if live_schema:
+        parts.append(f"\n## Live schema\n{live_schema}")
+
+    if network_log:
+        parts.append(f"\n## Network log (mutations captured during UI test)\n{network_log}")
+
+    parts.append(f"\n## UI data extracted from the page\n{data_json}")
+
+    parts.append(
+        "\n## Instructions\n"
+        "1. Use the database MCP tools to run SELECT queries and verify each check.\n"
+        "2. Only SELECT — never INSERT, UPDATE, DELETE.\n"
+        "3. Semantic equivalence is a pass: 'Bank Transfer' ≈ 'bank_transfer'.\n"
+        "\n## Output format\n"
+        "Output ONLY a JSON array (no other text):\n"
+        "```json\n"
+        "[\n"
+        '  {"check_name": "...", "query": "SELECT ...", "expected": "...", '
+        '"actual": "...", "status": "pass|fail|blocked", "severity": "high|medium|low"}\n'
+        "]\n"
+        "```"
+    )
+    return "\n".join(parts)
+
+
+async def verify_db_cli(
+    data_json: str,
+    profile: ProjectProfile,
+    db_checks: list[DBCheckItem],
+    live_schema: str = "",
+    network_log: str = "",
+    timeout_seconds: int = 300,
+) -> list[dict]:
+    """Run DB verification via Claude Code CLI + DB MCP server."""
+    if not db_checks:
+        return []
+
+    prompt = _build_db_verify_prompt(data_json, db_checks, live_schema, network_log)
+    logger.info(f"[cli-db] starting DB verification ({len(prompt)} chars prompt)")
+
+    db_mcp_config = _build_mcp_config_for_db(profile)
+    if not db_mcp_config.get("mcpServers"):
+        return [{
+            "check_name": "DB verification",
+            "query": "", "expected": "", "actual": "No DB MCP server configured",
+            "status": "blocked", "severity": "high",
+        }]
+
+    # Allow all tools from DB MCP servers
+    db_server_names = list(db_mcp_config["mcpServers"].keys())
+    allowed = ",".join(f"mcp__{name}__*" for name in db_server_names)
+
+    try:
+        stdout, stderr, rc = await _run_claude_cli(
+            prompt,
+            mcp_config=db_mcp_config,
+            allowed_tools=allowed,
+            timeout_seconds=timeout_seconds,
+            label="cli-db",
+        )
+    except Exception as e:
+        logger.error(f"[cli-db] error: {e}")
+        return [{
+            "check_name": "DB verification",
+            "query": "", "expected": "", "actual": f"CLI error: {e}",
+            "status": "blocked", "severity": "high",
+        }]
+
+    if rc != 0:
+        logger.warning(f"[cli-db] non-zero exit: {rc}")
+        return [{
+            "check_name": "DB verification",
+            "query": "", "expected": "", "actual": f"CLI exited {rc}: {stderr[-300:]}",
+            "status": "blocked", "severity": "high",
+        }]
+
+    parsed = _extract_json(stdout)
+    if isinstance(parsed, list):
+        return parsed
+    logger.warning(f"[cli-db] could not parse JSON array from output ({len(stdout)} chars)")
+    return [{
+        "check_name": "DB verification",
+        "query": "", "expected": "", "actual": "Could not parse DB CLI output",
+        "status": "blocked", "severity": "high",
+    }]
+
+
+# ---------------------------------------------------------------------------
+# Lesson generation via CLI
+# ---------------------------------------------------------------------------
+
+_LESSON_CLI_PROMPT = """\
+You are a QA memory system. A test execution agent just completed a run.
+Here is the run report:
+
+{report_summary}
+
+Output ONLY a JSON object (no markdown fences, no explanation):
+{{
+  "lesson": "<ONE paragraph, 3-5 sentences. Actionable guidance for the next attempt.>",
+  "tags": ["<2-6 lowercase tags>"]
+}}
+"""
+
+
+async def generate_lesson_cli(
+    report: ScenarioReport,
+    scenario: str,
+    timeout_seconds: int = 60,
+) -> tuple[str, list[str]]:
+    """Generate a lesson from the run report via Claude Code CLI (no MCP needed)."""
+    from universal_debug_agent.memory.lesson import _build_report_summary
+
+    summary = _build_report_summary(report, scenario)
+    prompt = _LESSON_CLI_PROMPT.format(report_summary=summary)
+
+    try:
+        stdout, _, rc = await _run_claude_cli(
+            prompt, timeout_seconds=timeout_seconds, label="cli-lesson",
+        )
+    except Exception as e:
+        logger.warning(f"[cli-lesson] failed: {e}")
+        return "", []
+
+    if rc != 0:
+        logger.warning(f"[cli-lesson] non-zero exit: {rc}")
+        return "", []
+
+    parsed = _extract_json(stdout)
+    if isinstance(parsed, dict):
+        lesson = str(parsed.get("lesson", "")).strip()
+        tags = [str(t).lower().strip() for t in parsed.get("tags", []) if t]
+        if lesson:
+            logger.info(f"Lesson generated ({len(lesson)} chars), tags: {tags}")
+        return lesson, tags
+
+    logger.warning("[cli-lesson] could not parse lesson JSON")
+    return "", []
 
 
 def cli_result_to_report(

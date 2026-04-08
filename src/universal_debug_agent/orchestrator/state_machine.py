@@ -24,6 +24,8 @@ from universal_debug_agent.orchestrator.input_filters import MCPToolOutputFilter
 from universal_debug_agent.orchestrator.claude_executor import (
     run_scenario_cli,
     cli_result_to_report,
+    verify_db_cli,
+    generate_lesson_cli,
 )
 from universal_debug_agent.observability.llm_usage import LLMUsageTracker
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
@@ -246,22 +248,29 @@ class InvestigationOrchestrator:
     async def run(self, scenario: str) -> ScenarioReport:
         """Run the full test execution pipeline."""
 
-        # Connect all MCP servers before running
-        for server in self.mcp_servers:
-            try:
-                await server.connect()
-                logger.info(f"Connected MCP server: {server.name}")
-            except Exception as e:
-                logger.error(f"Failed to connect MCP server {server.name}: {e}")
-                raise
+        is_cli = self.profile.boundaries.execution_mode == "cli"
+
+        # CLI mode: claude -p subprocess manages its own MCP connections.
+        # Agent mode: we need to connect MCP servers in this process.
+        if not is_cli:
+            for server in self.mcp_servers:
+                try:
+                    await server.connect()
+                    logger.info(f"Connected MCP server: {server.name}")
+                except Exception as e:
+                    logger.error(f"Failed to connect MCP server {server.name}: {e}")
+                    raise
 
         try:
-            if self.profile.boundaries.execution_mode == "cli":
+            if is_cli:
                 report = await self._run_pipeline_cli(scenario)
             else:
                 report = await self._run_pipeline(scenario)
             # Generate lesson BEFORE cleanup so anyio scopes from MCP servers are still clean
-            self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
+            if is_cli:
+                self.last_lesson, self.last_lesson_tags = await generate_lesson_cli(report, scenario)
+            else:
+                self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
             return report
         except BaseException as e:
             if self.usage_tracker is not None:
@@ -271,12 +280,12 @@ class InvestigationOrchestrator:
                 self.last_error_output_path = str(error_path) if error_path else ""
             raise
         finally:
-            # Disconnect all MCP servers (suppress all errors to preserve original exception)
-            for server in self.mcp_servers:
-                try:
-                    await server.cleanup()
-                except BaseException as e:
-                    logger.warning(f"Error cleaning up MCP server {server.name}: {e}")
+            if not is_cli:
+                for server in self.mcp_servers:
+                    try:
+                        await server.cleanup()
+                    except BaseException as e:
+                        logger.warning(f"Error cleaning up MCP server {server.name}: {e}")
 
     async def _run_pipeline(self, scenario: str) -> ScenarioReport:
         """Internal pipeline after MCP servers are connected."""
@@ -349,7 +358,7 @@ class InvestigationOrchestrator:
             scenario=scenario,
             profile=self.profile,
             db_checks=self.db_checks,
-            timeout_seconds=300,
+            timeout_seconds=600,
         )
 
         if self.trace_recorder is not None:
@@ -362,25 +371,15 @@ class InvestigationOrchestrator:
                 f"error={cli_result.error}",
             )
 
-        # Step 2: Run DB verification if we have db_checks and extracted data
+        # Step 2: Run DB verification via CLI if we have db_checks and extracted data
         db_verifications: list[dict] | None = None
         if self.db_checks and cli_result.success and cli_result.extracted_data:
-            logger.info("Phase: DB verification")
-            try:
-                raw = await db_tool.verify_in_db(
-                    json.dumps(cli_result.extracted_data)
-                )
-                db_verifications = json.loads(raw) if raw else None
-            except Exception as e:
-                logger.error(f"[cli] DB verification failed: {e}")
-                db_verifications = [{
-                    "check_name": "DB verification",
-                    "query": "",
-                    "expected": "",
-                    "actual": f"DB verification error: {e}",
-                    "status": "blocked",
-                    "severity": "high",
-                }]
+            logger.info("Phase: DB verification (Claude Code CLI)")
+            db_verifications = await verify_db_cli(
+                data_json=json.dumps(cli_result.extracted_data),
+                profile=self.profile,
+                db_checks=self.db_checks,
+            )
 
         # Step 3: Build report
         report = cli_result_to_report(cli_result, scenario, db_verifications)
