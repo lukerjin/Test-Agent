@@ -26,7 +26,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from universal_debug_agent.config import load_profile
-from universal_debug_agent.schemas.profile import ScenarioConfig
+from universal_debug_agent.schemas.profile import DBCheckItem, ScenarioConfig
 from universal_debug_agent.mcp.factory import create_mcp_servers
 from universal_debug_agent.memory.store import MemoryRecord, MemoryStore, resolve_memory_path
 from universal_debug_agent.models.factory import create_model
@@ -133,7 +133,7 @@ async def _run_test(
     output: str | None,
     max_steps: int | None,
     verbose: bool,
-    db_checks: list[str] | None = None,
+    db_checks: list[DBCheckItem] | None = None,
     scenario_name: str | None = None,
 ) -> None:
     # Setup logging
@@ -327,7 +327,7 @@ def test(
     """Execute a test scenario on the target application."""
 
     # Resolve named scenario from profile
-    db_checks: list[str] | None = None
+    db_checks: list[DBCheckItem] | None = None
     scenario_name: str | None = None
     try:
         _profile = load_profile(profile)

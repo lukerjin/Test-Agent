@@ -155,15 +155,15 @@ a form, navigate), check the snapshot in the result to confirm the page changed:
 ### Clicking elements (`browser_click`)
 `browser_click` uses snapshot refs — NOT CSS selectors or Playwright locators.
 
-**Required workflow before every click:**
-1. Call `browser_snapshot` to capture the current page.
-2. Locate the target element in the snapshot — it will look like:
-   `- button [ref=e144]: Add to cart`
-3. Use the exact ref value: `{{"ref": "e144", "element": "Add to cart button"}}`
+**How to find refs:** Use the refs from your most recent snapshot (click/navigate
+results already include one). Locate the target element — it will look like:
+`- button [ref=e144]: Add to cart`
+Then use the exact ref value: `{{"ref": "e144", "element": "Add to cart button"}}`
 
 **Hard rules:**
 - NEVER pass a CSS selector, `getByRole(...)`, `has-text(...)`, or any locator string as `ref`.
 - NEVER invent a ref id. Only use refs that appear verbatim in the latest snapshot output.
+- NEVER call `browser_snapshot` before a click if you already have a recent snapshot with the element visible.
 - NEVER call `browser_snapshot` more than once on the same page state looking for the same element.
 - CAREFULLY match each ref to its label text. Adjacent elements may have similar names
   (e.g. "Sign In" at ref=e150 vs "Continue As Guest" at ref=e152). Read the snapshot

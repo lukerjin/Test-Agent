@@ -152,7 +152,7 @@ def grep_code(pattern: str, directory: str = "", file_glob: str = "*") -> str:
 def create_db_agent(
     mcp_servers: list[MCPServerStdio],
     model: Any = None,
-    db_checks: list[str] | None = None,
+    db_checks: list | None = None,
     live_schema: str = "",
     network_log: str = "",
     code_root_dir: str = "",
@@ -163,7 +163,21 @@ def create_db_agent(
 
     instructions = _DB_PROMPT_FOCUSED
     if db_checks:
-        checks_text = "\n".join(f"{i}. {c}" for i, c in enumerate(db_checks, 1))
+        check_lines = []
+        for i, c in enumerate(db_checks, 1):
+            if isinstance(c, str):
+                check_lines.append(f"{i}. {c}")
+            else:
+                # Structured DBCheck
+                parts = [f"{i}. **Table:** {c.table}"]
+                if c.find_by:
+                    parts.append(f"   Find by: {c.find_by}")
+                if c.verify:
+                    parts.append(f"   Verify: {c.verify}")
+                if c.hint:
+                    parts.append(f"   ⚠ HINT: {c.hint}")
+                check_lines.append("\n".join(parts))
+        checks_text = "\n".join(check_lines)
         instructions += (
             f"\n## Verification Checklist (from scenario config)\n\n"
             f"{checks_text}\n"

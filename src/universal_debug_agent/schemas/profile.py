@@ -90,11 +90,24 @@ class BoundariesConfig(BaseModel):
     filter: FilterConfig = Field(default_factory=FilterConfig)
 
 
+class DBCheck(BaseModel):
+    """A structured DB verification check."""
+
+    table: str
+    find_by: str = ""
+    verify: str = ""
+    hint: str = ""
+
+
+# A db_check can be either a plain string or a structured DBCheck
+DBCheckItem = str | DBCheck
+
+
 class ScenarioConfig(BaseModel):
     """A test scenario with optional DB verification hints."""
 
     description: str
-    db_checks: list[str] = Field(default_factory=list)
+    db_checks: list[DBCheckItem] = Field(default_factory=list)
 
 
 class ProjectProfile(BaseModel):
