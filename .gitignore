@@ -20,6 +20,7 @@ htmlcov/
 .coverage
 .DS_Store
 artifacts/
+.playwright-mcp/
 memory/
 usage/
 uv.lock

@@ -17,6 +17,7 @@ from agents.mcp import MCPServerStdio
 from pathlib import Path
 
 from universal_debug_agent.agents.brain import create_brain_agent
+from universal_debug_agent.generators.codegen import generate_and_validate, generate_and_validate_cli
 from universal_debug_agent.tools import db_tool
 from universal_debug_agent.memory.lesson import generate_lesson
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
@@ -188,6 +189,9 @@ class InvestigationOrchestrator:
         self.last_error_output_path: str = ""
         self.last_lesson: str = ""
         self.last_lesson_tags: list[str] = []
+        self.generated_test_path: str = ""
+        self._hooks: InvestigationHooks | None = None
+        self._scenario_name = scenario_name
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(
             max_steps=profile.boundaries.max_steps,
@@ -271,6 +275,10 @@ class InvestigationOrchestrator:
                 self.last_lesson, self.last_lesson_tags = await generate_lesson_cli(report, scenario)
             else:
                 self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
+
+            # v2: generate executable test code when all checks pass
+            if self._should_generate_test(report):
+                await self._generate_test(report, scenario)
             return report
         except BaseException as e:
             if self.usage_tracker is not None:
@@ -303,6 +311,7 @@ class InvestigationOrchestrator:
             trace_recorder=self.trace_recorder,
             playwright_server=playwright_server,
         )
+        self._hooks = hooks
         # Connect hooks to filter so auto-snapshots can be injected
         self._run_config.call_model_input_filter.hooks = hooks
 
@@ -431,6 +440,54 @@ class InvestigationOrchestrator:
             raw_path = self.usage_tracker.write_final_output(result.final_output)
             self.last_raw_output_path = str(raw_path) if raw_path else ""
         return self._extract_report(result)
+
+    def _should_generate_test(self, report: ScenarioReport) -> bool:
+        """Check if the run qualifies for test code generation."""
+        if report.overall_status != StepStatus.PASS:
+            return False
+        if not self._hooks or not self._hooks.action_log.records:
+            return False
+        # All data verifications must pass (if any exist)
+        for v in report.data_verifications:
+            if v.status != StepStatus.PASS:
+                return False
+        return True
+
+    async def _generate_test(self, report: ScenarioReport, scenario: str) -> None:
+        """Generate executable test code, validate by running it, fix on failure."""
+        if self._hooks is None:
+            return
+
+        logger.info("Phase: Test code generation + validation")
+
+        output_dir = Path("artifacts") / "generated_tests"
+        scenario_name = getattr(self, "_scenario_name", None) or "test"
+
+        if self.profile.boundaries.execution_mode == "cli":
+            path, passed = await generate_and_validate_cli(
+                action_log=self._hooks.action_log,
+                ref_map=self._hooks.ref_map,
+                report=report,
+                profile=self.profile,
+                output_dir=output_dir,
+                scenario_name=scenario_name,
+            )
+        else:
+            path, passed = await generate_and_validate(
+                action_log=self._hooks.action_log,
+                ref_map=self._hooks.ref_map,
+                report=report,
+                profile=self.profile,
+                model=self.model,
+                output_dir=output_dir,
+                scenario_name=scenario_name,
+            )
+        if path:
+            self.generated_test_path = str(path)
+            if passed:
+                logger.info(f"[codegen] validated test saved to {path}")
+            else:
+                logger.warning(f"[codegen] test saved but NOT passing: {path}")
 
     def _unwrap_mode_switch(self, error: BaseException) -> SwitchToAnalysisMode | None:
         current: BaseException | None = error
