@@ -88,6 +88,11 @@ class BoundariesConfig(BaseModel):
     stuck_budget_ratio: float = Field(default=0.85, ge=0.5, le=1.0)
     allowed_domains: list[str] = Field(default_factory=list)
     filter: FilterConfig = Field(default_factory=FilterConfig)
+    execution_mode: str = Field(
+        default="agent",
+        pattern=r"^(agent|cli)$",
+        description="UI execution engine: 'agent' (OpenAI Agents SDK) or 'cli' (Claude Code CLI)",
+    )
 
 
 class DBCheck(BaseModel):

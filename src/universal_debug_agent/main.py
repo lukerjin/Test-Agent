@@ -135,6 +135,7 @@ async def _run_test(
     verbose: bool,
     db_checks: list[DBCheckItem] | None = None,
     scenario_name: str | None = None,
+    execution_mode: str | None = None,
 ) -> None:
     # Setup logging
     log_level = logging.DEBUG if verbose else logging.INFO
@@ -150,6 +151,10 @@ async def _run_test(
     # Override max_steps if specified
     if max_steps is not None:
         profile.boundaries.max_steps = max_steps
+
+    # Override execution_mode if specified via CLI flag
+    if execution_mode is not None:
+        profile.boundaries.execution_mode = execution_mode
 
     # Configure code tools with the project root
     code_tools.configure(profile.code.root_dir)
@@ -200,6 +205,13 @@ async def _run_test(
         Path(usage_dir) / "runs" / usage_tracker.run_id
     )
     console.print(f"[green]LLM usage:[/green] {usage_dir}")
+
+    # Show execution mode
+    exec_mode = profile.boundaries.execution_mode
+    if exec_mode == "cli":
+        console.print("[green]Execution mode:[/green] Claude Code CLI")
+    else:
+        console.print(f"[green]Execution mode:[/green] Agent (OpenAI Agents SDK)")
 
     # Run test
     console.print(Panel(scenario, title="Test Scenario", border_style="blue"))
@@ -323,6 +335,7 @@ def test(
     output: Optional[str] = typer.Option(None, "--output", "-o", help="Output report file path"),
     max_steps: Optional[int] = typer.Option(None, "--max-steps", help="Override max steps"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Enable verbose logging"),
+    mode: Optional[str] = typer.Option(None, "--mode", "-m", help="Execution mode: 'agent' or 'cli' (Claude Code CLI)"),
 ) -> None:
     """Execute a test scenario on the target application."""
 
@@ -368,6 +381,7 @@ def test(
             verbose=verbose,
             db_checks=db_checks,
             scenario_name=scenario_name,
+            execution_mode=mode,
         ))
     except (RateLimitError, APIStatusError) as e:
         provider = "LLM"

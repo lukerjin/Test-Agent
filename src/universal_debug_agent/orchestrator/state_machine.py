@@ -21,9 +21,13 @@ from universal_debug_agent.tools import db_tool
 from universal_debug_agent.memory.lesson import generate_lesson
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
 from universal_debug_agent.orchestrator.input_filters import MCPToolOutputFilter
+from universal_debug_agent.orchestrator.claude_executor import (
+    run_scenario_cli,
+    cli_result_to_report,
+)
 from universal_debug_agent.observability.llm_usage import LLMUsageTracker
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
-from universal_debug_agent.schemas.profile import ProjectProfile
+from universal_debug_agent.schemas.profile import DBCheckItem, ProjectProfile
 from universal_debug_agent.schemas.report import (
     ReportMetadata,
     StepStatus,
@@ -225,6 +229,7 @@ class InvestigationOrchestrator:
             db_checks=db_checks,
             scenario_name=scenario_name,
         )
+        self.db_checks = db_checks
         db_tool.clear_captured_form_data()
 
     @staticmethod
@@ -251,7 +256,10 @@ class InvestigationOrchestrator:
                 raise
 
         try:
-            report = await self._run_pipeline(scenario)
+            if self.profile.boundaries.execution_mode == "cli":
+                report = await self._run_pipeline_cli(scenario)
+            else:
+                report = await self._run_pipeline(scenario)
             # Generate lesson BEFORE cleanup so anyio scopes from MCP servers are still clean
             self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
             return report
@@ -330,6 +338,60 @@ class InvestigationOrchestrator:
                     self.trace_recorder.record("mode_switch", "Switch To Analysis", mode_switch.reason)
                 return await self._run_analysis(scenario, mode_switch.evidence_summary)
             raise
+
+    async def _run_pipeline_cli(self, scenario: str) -> ScenarioReport:
+        """Run UI execution via Claude Code CLI, then DB verification separately."""
+        self.state = InvestigationState.REACT
+        logger.info("Phase: UI execution (Claude Code CLI)")
+
+        # Step 1: Run UI scenario via Claude Code CLI
+        cli_result = await run_scenario_cli(
+            scenario=scenario,
+            profile=self.profile,
+            db_checks=self.db_checks,
+            timeout_seconds=300,
+        )
+
+        if self.trace_recorder is not None:
+            self.trace_recorder.record(
+                "cli_result",
+                "Claude CLI Result",
+                f"success={cli_result.success}, "
+                f"steps={len(cli_result.steps)}, "
+                f"extracted_data={json.dumps(cli_result.extracted_data)}, "
+                f"error={cli_result.error}",
+            )
+
+        # Step 2: Run DB verification if we have db_checks and extracted data
+        db_verifications: list[dict] | None = None
+        if self.db_checks and cli_result.success and cli_result.extracted_data:
+            logger.info("Phase: DB verification")
+            try:
+                raw = await db_tool.verify_in_db(
+                    json.dumps(cli_result.extracted_data)
+                )
+                db_verifications = json.loads(raw) if raw else None
+            except Exception as e:
+                logger.error(f"[cli] DB verification failed: {e}")
+                db_verifications = [{
+                    "check_name": "DB verification",
+                    "query": "",
+                    "expected": "",
+                    "actual": f"DB verification error: {e}",
+                    "status": "blocked",
+                    "severity": "high",
+                }]
+
+        # Step 3: Build report
+        report = cli_result_to_report(cli_result, scenario, db_verifications)
+        report.metadata = ReportMetadata(
+            profile_name=self.profile.project.name,
+            total_steps=len(cli_result.steps),
+            mode_switches=0,
+        )
+
+        self.state = InvestigationState.DONE
+        return report
 
     async def _run_analysis(self, scenario: str, evidence_summary: str) -> ScenarioReport:
         """Phase 2: Analysis mode — analyze what happened when agent got stuck."""
