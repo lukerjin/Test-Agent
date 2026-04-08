@@ -192,6 +192,7 @@ class InvestigationOrchestrator:
         self.generated_test_path: str = ""
         self._hooks: InvestigationHooks | None = None
         self._scenario_name = scenario_name
+        self._cli_result = None  # Saved for CLI-mode codegen
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(
             max_steps=profile.boundaries.max_steps,
@@ -370,6 +371,8 @@ class InvestigationOrchestrator:
             timeout_seconds=600,
         )
 
+        self._cli_result = cli_result  # Save for codegen
+
         if self.trace_recorder is not None:
             self.trace_recorder.record(
                 "cli_result",
@@ -445,8 +448,14 @@ class InvestigationOrchestrator:
         """Check if the run qualifies for test code generation."""
         if report.overall_status != StepStatus.PASS:
             return False
-        if not self._hooks or not self._hooks.action_log.records:
-            return False
+        # CLI mode: need cli_result with steps; Agent mode: need hooks with action log
+        is_cli = self.profile.boundaries.execution_mode == "cli"
+        if is_cli:
+            if not self._cli_result or not self._cli_result.steps:
+                return False
+        else:
+            if not self._hooks or not self._hooks.action_log.records:
+                return False
         # All data verifications must pass (if any exist)
         for v in report.data_verifications:
             if v.status != StepStatus.PASS:
@@ -455,9 +464,6 @@ class InvestigationOrchestrator:
 
     async def _generate_test(self, report: ScenarioReport, scenario: str) -> None:
         """Generate executable test code, validate by running it, fix on failure."""
-        if self._hooks is None:
-            return
-
         logger.info("Phase: Test code generation + validation")
 
         output_dir = Path("artifacts") / "generated_tests"
@@ -465,13 +471,13 @@ class InvestigationOrchestrator:
 
         if self.profile.boundaries.execution_mode == "cli":
             path, passed = await generate_and_validate_cli(
-                action_log=self._hooks.action_log,
-                ref_map=self._hooks.ref_map,
                 report=report,
                 profile=self.profile,
                 output_dir=output_dir,
                 scenario_name=scenario_name,
             )
+        elif self._hooks is None:
+            return
         else:
             path, passed = await generate_and_validate(
                 action_log=self._hooks.action_log,

@@ -568,20 +568,30 @@ def _strip_fences(text: str) -> str:
     return text
 
 
+def _build_steps_summary(report: ScenarioReport) -> str:
+    """Build an action summary from report steps (for CLI mode without action_log)."""
+    lines: list[str] = []
+    for s in report.steps_executed:
+        lines.append(f"{s.step_number}. [{s.status.value}] {s.action}")
+        if s.actual_result:
+            lines.append(f"   Result: {s.actual_result}")
+        if s.notes:
+            lines.append(f"   Notes: {s.notes}")
+    return "\n".join(lines) if lines else "(no steps recorded)"
+
+
 async def _generate_test_code_cli(
-    action_log: ActionLog,
-    ref_map: SnapshotRefMap,
     report: ScenarioReport,
     profile: ProjectProfile,
 ) -> str | None:
-    """Generate test code via Claude Code CLI (no MCP needed)."""
+    """Generate test code via Claude Code CLI using report steps (no action_log needed)."""
     from universal_debug_agent.orchestrator.claude_executor import _run_claude_cli
 
-    if not action_log.records:
-        logger.warning("[codegen-cli] no actions recorded, skipping")
+    if not report.steps_executed:
+        logger.warning("[codegen-cli] no steps in report, skipping")
         return None
 
-    action_summary = _build_action_summary(action_log, ref_map)
+    action_summary = _build_steps_summary(report)
 
     db_lines: list[str] = []
     for v in report.data_verifications:
@@ -653,15 +663,13 @@ async def _fix_test_code_cli(code: str, error_output: str) -> str | None:
 
 
 async def generate_and_validate_cli(
-    action_log: ActionLog,
-    ref_map: SnapshotRefMap,
     report: ScenarioReport,
     profile: ProjectProfile,
     output_dir: str | Path = "artifacts/generated_tests",
     scenario_name: str = "test",
 ) -> tuple[Path | None, bool]:
     """CLI variant of generate_and_validate — all LLM calls go through claude -p."""
-    code = await _generate_test_code_cli(action_log, ref_map, report, profile)
+    code = await _generate_test_code_cli(report, profile)
     if not code:
         return None, False
 
