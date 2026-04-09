@@ -679,12 +679,6 @@ async def generate_and_validate_cli(
             logger.info(f"[codegen-cli] test PASSED on attempt {attempt}")
             return file_path, True
 
-        if attempt >= MAX_FIX_ATTEMPTS:
-            logger.warning(
-                f"[codegen-cli] still failing after {MAX_FIX_ATTEMPTS} attempts"
-            )
-            break
-
         error_output = ""
         if stderr:
             error_output += stderr
@@ -692,6 +686,12 @@ async def generate_and_validate_cli(
             error_output += "\n" + stdout
 
         logger.info(f"[codegen-cli] attempt {attempt} failed, error:\n{error_output[:2000]}")
+
+        if attempt >= MAX_FIX_ATTEMPTS:
+            logger.warning(
+                f"[codegen-cli] still failing after {MAX_FIX_ATTEMPTS} attempts"
+            )
+            break
 
         # Fix — tell Claude to read the file, fix it, save it back
         fix_prompt = (
