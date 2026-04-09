@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -176,7 +174,7 @@ class InvestigationOrchestrator:
         memory_context: str = "",
         usage_tracker: LLMUsageTracker | None = None,
         trace_recorder: ExecutionTraceRecorder | None = None,
-        db_checks: list[str | Any] | None = None,
+        db_checks: list[DBCheckItem] | None = None,
         scenario_name: str | None = None,
     ):
         self.profile = profile
@@ -278,7 +276,11 @@ class InvestigationOrchestrator:
                 self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
 
             # v2: generate executable test code when all checks pass
-            if self._should_generate_test(report):
+            should_gen = self._should_generate_test(report)
+            logger.info(f"[codegen] should_generate_test={should_gen}, status={report.overall_status.value}, "
+                        f"cli_result_steps={len(self._cli_result.steps) if self._cli_result else 'N/A'}, "
+                        f"hooks={self._hooks is not None}")
+            if should_gen:
                 await self._generate_test(report, scenario)
             return report
         except BaseException as e:
@@ -380,11 +382,17 @@ class InvestigationOrchestrator:
                 f"success={cli_result.success}, "
                 f"steps={len(cli_result.steps)}, "
                 f"extracted_data={json.dumps(cli_result.extracted_data)}, "
-                f"error={cli_result.error}",
+                f"error={cli_result.error}\n\n"
+                f"## Raw Output ({len(cli_result.raw_output)} chars)\n"
+                f"{cli_result.raw_output[:3000]}",
             )
 
         # Step 2: Run DB verification via CLI if we have db_checks and extracted data
         db_verifications: list[dict] | None = None
+        logger.info(
+            f"[cli] DB verify gate: db_checks={bool(self.db_checks)} ({len(self.db_checks) if self.db_checks else 0}), "
+            f"success={cli_result.success}, extracted_data={bool(cli_result.extracted_data)}"
+        )
         if self.db_checks and cli_result.success and cli_result.extracted_data:
             logger.info("Phase: DB verification (Claude Code CLI)")
             db_verifications = await verify_db_cli(
@@ -475,6 +483,7 @@ class InvestigationOrchestrator:
                 profile=self.profile,
                 output_dir=output_dir,
                 scenario_name=scenario_name,
+                scenario=scenario,
             )
         elif self._hooks is None:
             return

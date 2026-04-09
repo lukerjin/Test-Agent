@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from universal_debug_agent.schemas.report import ScenarioReport
 
 logger = logging.getLogger(__name__)
 
-MAX_FIX_ATTEMPTS = 3
+MAX_FIX_ATTEMPTS = 1
 RUN_TIMEOUT_SECONDS = 120
 
 
@@ -556,41 +557,28 @@ async def generate_and_validate(
 # ── Claude Code CLI variants ────────────────────────────────────
 
 
-def _strip_fences(text: str) -> str:
-    """Strip markdown code fences from LLM output."""
-    if text.startswith("```"):
-        lines = text.splitlines()
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        return "\n".join(lines)
-    return text
-
 
 def _build_steps_summary(report: ScenarioReport) -> str:
     """Build an action summary from report steps (for CLI mode without action_log)."""
     lines: list[str] = []
     for s in report.steps_executed:
         lines.append(f"{s.step_number}. [{s.status.value}] {s.action}")
+        if s.notes:
+            # notes contains locator, context, url_after from CLI execution
+            for part in s.notes.split(" | "):
+                lines.append(f"   {part}")
         if s.actual_result:
             lines.append(f"   Result: {s.actual_result}")
-        if s.notes:
-            lines.append(f"   Notes: {s.notes}")
     return "\n".join(lines) if lines else "(no steps recorded)"
 
 
-async def _generate_test_code_cli(
+def _build_codegen_prompt(
     report: ScenarioReport,
     profile: ProjectProfile,
-) -> str | None:
-    """Generate test code via Claude Code CLI using report steps (no action_log needed)."""
-    from universal_debug_agent.orchestrator.claude_executor import _run_claude_cli
-
-    if not report.steps_executed:
-        logger.warning("[codegen-cli] no steps in report, skipping")
-        return None
-
+    file_path: Path,
+    scenario: str = "",
+) -> str:
+    """Build the prompt for CLI codegen — instructs Claude to write the file directly."""
     action_summary = _build_steps_summary(report)
 
     db_lines: list[str] = []
@@ -609,57 +597,39 @@ async def _generate_test_code_cli(
     )
 
     auth_lines: list[str] = []
+    if profile.auth.login_url:
+        auth_lines.append(f"- Login URL: {profile.auth.login_url}")
+        auth_lines.append(f"- Method: {profile.auth.method}")
     if profile.auth.test_accounts:
         for acc in profile.auth.test_accounts:
-            auth_lines.append(f"- Role: {acc.role}")
-    auth_info = "\n".join(auth_lines) if auth_lines else "(no auth)"
+            username = os.environ.get(acc.username_env, acc.username_env)
+            password = os.environ.get(acc.password_env, acc.password_env)
+            auth_lines.append(f"- Account ({acc.role}): email={username}, password={password}")
+    if not auth_lines:
+        auth_lines.append("(no auth)")
+    auth_lines.append("")
+    auth_lines.append(
+        "IMPORTANT: The generated test runs in a fresh browser with NO session. "
+        "The test MUST log in first before proceeding with the scenario steps."
+    )
+    auth_info = "\n".join(auth_lines)
 
-    prompt = _CODEGEN_PROMPT.format(
+    scenario_text = scenario or report.scenario_summary
+
+    base_prompt = _CODEGEN_PROMPT.format(
         base_url=profile.environment.base_url,
-        scenario_summary=report.scenario_summary,
+        scenario_summary=scenario_text,
         action_summary=action_summary,
         db_verifications=db_text,
         extracted_data=extracted,
         auth_info=auth_info,
     )
 
-    try:
-        stdout, _, rc = await _run_claude_cli(
-            prompt, timeout_seconds=120, label="codegen",
-        )
-    except Exception as e:
-        logger.error(f"[codegen-cli] generation failed: {e}")
-        return None
-
-    if rc != 0:
-        logger.warning(f"[codegen-cli] non-zero exit: {rc}")
-        return None
-
-    code = _strip_fences(stdout.strip())
-    logger.info(f"[codegen-cli] generated {len(code)} chars of test code")
-    return code
-
-
-async def _fix_test_code_cli(code: str, error_output: str) -> str | None:
-    """Fix failing test code via Claude Code CLI."""
-    from universal_debug_agent.orchestrator.claude_executor import _run_claude_cli
-
-    prompt = _FIX_PROMPT.format(code=code, error_output=error_output[-3000:])
-
-    try:
-        stdout, _, rc = await _run_claude_cli(
-            prompt, timeout_seconds=120, label="codegen-fix",
-        )
-    except Exception as e:
-        logger.error(f"[codegen-cli] fix failed: {e}")
-        return None
-
-    if rc != 0:
-        return None
-
-    fixed = _strip_fences(stdout.strip())
-    logger.info(f"[codegen-cli] fix produced {len(fixed)} chars")
-    return fixed
+    return (
+        f"{base_prompt}\n\n"
+        f"IMPORTANT: Write the generated code to this file: {file_path.resolve()}\n"
+        f"Use the Write tool to save the complete .js file."
+    )
 
 
 async def generate_and_validate_cli(
@@ -667,14 +637,37 @@ async def generate_and_validate_cli(
     profile: ProjectProfile,
     output_dir: str | Path = "artifacts/generated_tests",
     scenario_name: str = "test",
+    scenario: str = "",
 ) -> tuple[Path | None, bool]:
-    """CLI variant of generate_and_validate — all LLM calls go through claude -p."""
-    code = await _generate_test_code_cli(report, profile)
-    if not code:
+    """CLI codegen: let Claude write the file directly, then validate by running it."""
+    from universal_debug_agent.orchestrator.claude_executor import _run_claude_cli
+
+    if not report.steps_executed:
+        logger.warning("[codegen-cli] no steps in report, skipping")
         return None, False
 
-    file_path = save_generated_test(code, output_dir, scenario_name)
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in scenario_name)
+    file_path = out / f"{safe_name}.js"
 
+    # Step 1: Generate — Claude writes the file via its tools
+    prompt = _build_codegen_prompt(report, profile, file_path, scenario)
+    try:
+        _, _, rc = await _run_claude_cli(
+            prompt, timeout_seconds=300, label="codegen",
+        )
+    except Exception as e:
+        logger.error(f"[codegen-cli] generation failed: {type(e).__name__}: {e!r}")
+        return None, False
+
+    if not file_path.exists():
+        logger.warning(f"[codegen-cli] Claude did not create {file_path}")
+        return None, False
+
+    logger.info(f"[codegen-cli] generated {file_path.stat().st_size} bytes -> {file_path}")
+
+    # Step 2: Run → fix loop
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
         logger.info(f"[codegen-cli] validation attempt {attempt}/{MAX_FIX_ATTEMPTS}")
 
@@ -698,12 +691,31 @@ async def generate_and_validate_cli(
         if stdout:
             error_output += "\n" + stdout
 
-        logger.info(f"[codegen-cli] attempt {attempt} failed, asking Claude to fix...")
-        fixed_code = await _fix_test_code_cli(code, error_output)
-        if not fixed_code:
+        logger.info(f"[codegen-cli] attempt {attempt} failed, error:\n{error_output[:2000]}")
+
+        # Fix — tell Claude to read the file, fix it, save it back
+        fix_prompt = (
+            f"The test at {file_path.resolve()} is failing. Fix it.\n\n"
+            f"## Error Output\n```\n{error_output[-3000:]}\n```\n\n"
+            f"Read the file, fix the specific error, and save the corrected version.\n"
+            f"Common fixes:\n"
+            f"- strict mode violation → use a more specific selector\n"
+            f"- element not found → add waitForSelector or waitForTimeout\n"
+            f"- navigation timeout → increase timeout\n"
+            f"- assertion failed → fix the SQL or comparison\n"
+        )
+        try:
+            _, _, fix_rc = await _run_claude_cli(
+                fix_prompt, timeout_seconds=300, label="codegen-fix",
+            )
+        except Exception as e:
+            logger.error(f"[codegen-cli] fix failed: {type(e).__name__}: {e!r}")
             break
 
-        code = fixed_code
-        file_path.write_text(code, encoding="utf-8")
+        if not file_path.exists():
+            logger.warning("[codegen-cli] file disappeared after fix")
+            break
+
+        logger.info(f"[codegen-cli] fix applied ({file_path.stat().st_size} bytes)")
 
     return file_path, False
