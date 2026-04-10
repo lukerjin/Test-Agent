@@ -1,0 +1,166 @@
+project:
+  name: "Vue admin Agent Testing"
+  description: "Vue admin platform for demonstrating the test agent"
+
+environment:
+  type: "web"
+  base_url: "https://vueadmin.local.test/admin"
+
+auth:
+  method: "form"
+  login_url: "/login"
+  test_accounts:
+    - role: "admin"
+      username_env: "TEST_ADMIN_USER"
+      password_env: "TEST_ADMIN_PASS"
+    - role: "user"
+      username_env: "TEST_USER_USER"
+      password_env: "TEST_USER_PASS"
+
+# --- LLM Configuration ---
+# Uncomment ONE of the following blocks:
+
+# Option 1: OpenAI (default)
+model:
+  provider: "openai"
+  model_name: "gpt-5.4-nano"
+  api_key_env: "OPENAI_API_KEY" # default, auto-detected
+
+# Option 2: Gemini (free tier available)
+# model:
+#   provider: "gemini"
+#   model_name: "gemini-2.0-flash"
+#   api_key_env: "GEMINI_API_KEY"
+
+# Option 3: DeepSeek
+# model:
+#   provider: "deepseek"
+#   model_name: "deepseek-chat"
+#   api_key_env: "DEEPSEEK_API_KEY"
+
+# Option 4: Any OpenAI-compatible API
+# model:
+#   provider: "custom"
+#   model_name: "your-model-name"
+#   base_url: "https://your-api.example.com/v1"
+#   api_key_env: "YOUR_API_KEY"
+
+# --- Memory ---
+memory:
+  enabled: false
+  path: "./memory/{project_name}.jsonl" # auto-creates, per-project file
+  max_entries_in_prompt: 2 # inject last N records into prompt
+
+code:
+  root_dir: "/Users/jin/workplace/vueadmin"
+  branch: "main"
+  entry_dirs:
+    - "ink_codebase"
+
+mcp_servers:
+  playwright:
+    enabled: true
+    command: "npx"
+    args:
+      [
+        "@playwright/mcp@latest",
+        "--browser",
+        "chromium",
+        "--timeout-action",
+        "15000",
+        "--ignore-https-errors",
+      ]
+    cwd: "./artifacts/playwright"
+    cache_tools_list: true
+    client_session_timeout_seconds: 30
+    allowed_tools:
+      - browser_navigate
+      - browser_snapshot
+      - browser_click
+      - browser_type
+      - browser_fill_form
+      - browser_select_option
+      - browser_press_key
+      - browser_handle_dialog
+      - browser_wait_for
+      - browser_take_screenshot
+      - browser_network_requests
+  database:
+    enabled: true
+    role: database
+    command: "/Users/jin/.nvm/versions/node/v24.10.0/bin/node"
+    args: ["/Users/jin/mysql57-mcp-server/index.js"]
+    cache_tools_list: true
+    blocked_tools:
+      - describe_all_tables
+    env:
+      DB_TYPE: "mysql"
+      DB_HOST_ENV: "DB_HOST"
+      DB_PORT_ENV: "DB_PORT"
+      DB_USER_ENV: "DB_USER"
+      DB_PASSWORD_ENV: "DB_PASSWORD"
+      DB_ALIASES_ENV: "DB_ALIASES"
+boundaries:
+  readonly: true
+  forbidden_actions:
+    - "DELETE FROM"
+    - "DROP TABLE"
+    - "INSERT INTO"
+    - "UPDATE"
+  max_steps: 40
+  max_turns: 30
+  stuck_budget_ratio: 0.85
+  allowed_domains:
+    - "vueadmin.local.test"
+
+scenarios:
+  updateLocation:
+    description: |
+      - "Navigate to https://vueadmin.local.test/admin/warehouse/inventory?cga_inventory_id=2039"
+      - click location-box to open an edit location popup/dialog.
+      - "In the edit location popup, clear the input field, type 'pending', and press Enter"
+      - "Click the 'update location' button to confirm the change"
+    db_checks:
+      - "warehouse_management.inventory_stock_details this inventory item ref_id updated to 6"
+  transferGroundToLabel:
+    description: |
+      Transfer 1 unit from ground location "test" to label "a2".
+
+      Steps:
+      - Navigate to "https://vueadmin.local.test/admin/warehouse/inventory?cga_inventory_id=2039"
+      - Wait for inventory data to load (location cards visible under GROUND and LABELS sections)
+      - Under the GROUND section, click the card named "test" (shows location name + qty) to open the Edit Inventory dialog
+      - The dialog opens with tabs: Stocktake, Transfer, Internal Use — click the "Transfer" tab
+      - In the qty input area, set: Inbox=1, Box=1, Total=1 (this transfers exactly 1 unit)
+      - In the TO section, the "Label" radio should already be selected. If not, select it
+      - In the "Scan Label ID" field, type "a2" and press Enter to validate
+      - After validation, Dispatch Centre and Area auto-populate
+      - Click the "Confirm Transfer" button
+      - Verify success snackbar shows "Transfer successfully"
+      - Verify the page reloads with updated quantities
+
+      Key info for DB verification:
+      - inventory_id = 2039
+      - Ground source: type_id=3, ref_id=3
+      - Label "A2" destination: type_id=1, ref_id=2
+      - Transfer qty = 1 (the "Total" field value)
+      - action_type=2 means transfer in the logs table
+    db_checks:
+      - table: "inkstation_barcode_db.inventory_stock_details"
+        find_by: "inventory_id=2039, type_id=3, ref_id=3"
+        verify: "total decreased by 1 (the transfer qty)"
+        hint: "compare current total against pre-transfer snapshot, or check diff_qty=-1 in the logs"
+
+      - table: "inkstation_barcode_db.inventory_stock_details"
+        find_by: "inventory_id=2039, type_id=1, ref_id=2"
+        verify: "total increased by 1"
+
+      - table: "inkstation_barcode_db.inventory_stock_details_logs"
+        find_by: "inventory_id=2039, action_type=2, diff_qty=-1, type_id=3, ref_id=3"
+        verify: "log entry exists with created_at today"
+        hint: "filter by id > pre-transfer max log id to only check new entries"
+
+      - table: "inkstation_barcode_db.inventory_stock_details_logs"
+        find_by: "inventory_id=2039, action_type=2, diff_qty=+1, type_id=1, ref_id=2"
+        verify: "log entry exists, source field = source log id from check above"
+        hint: "filter by id > pre-transfer max log id"
