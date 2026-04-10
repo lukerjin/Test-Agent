@@ -393,7 +393,7 @@ class InvestigationOrchestrator:
             f"[cli] DB verify gate: db_checks={bool(self.db_checks)} ({len(self.db_checks) if self.db_checks else 0}), "
             f"success={cli_result.success}, extracted_data={bool(cli_result.extracted_data)}"
         )
-        if self.db_checks and cli_result.success and cli_result.extracted_data:
+        if self.db_checks and cli_result.success:
             logger.info("Phase: DB verification (Claude Code CLI)")
             db_verifications = await verify_db_cli(
                 data_json=json.dumps(cli_result.extracted_data),
@@ -484,6 +484,7 @@ class InvestigationOrchestrator:
                 output_dir=output_dir,
                 scenario_name=scenario_name,
                 scenario=scenario,
+                db_checks=self.db_checks,
             )
         elif self._hooks is None:
             return

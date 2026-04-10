@@ -646,7 +646,7 @@ def cli_result_to_report(
                 query=str(v.get("query", "")),
                 expected=str(v.get("expected", "")),
                 actual=str(v.get("actual", "")),
-                status=StepStatus(v.get("status", "blocked")),
+                status=StepStatus(v.get("status", "blocked")) if v.get("status", "blocked") in ("pass", "fail", "skip", "blocked") else StepStatus.BLOCKED,
                 severity=str(v.get("severity", "high")),
             ))
 

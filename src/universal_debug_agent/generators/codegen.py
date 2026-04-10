@@ -24,7 +24,8 @@ from universal_debug_agent.schemas.report import ScenarioReport
 
 logger = logging.getLogger(__name__)
 
-MAX_FIX_ATTEMPTS = 1
+MAX_FIX_ATTEMPTS = 3        # agent mode (OpenAI) — generate + up to 2 fix attempts
+MAX_FIX_ATTEMPTS_CLI = 1    # CLI mode — generate only, no retry for now
 RUN_TIMEOUT_SECONDS = 120
 
 
@@ -170,9 +171,10 @@ async function sleep(ms) {{
   return new Promise((r) => setTimeout(r, ms));
 }}
 
-function mysqlQuery(sql, database = 'inkstation') {{
+function mysqlQuery(sql, database = '{default_database}') {{
   const {{ execSync }} = require('child_process');
-  const cmd = `docker exec dockers-mysql57-1 mysql -u root -proot ${{database}} -N -e "${{sql.replace(/"/g, '\\\\"')}}" 2>/dev/null`;
+  const dbArg = database ? ` ${{database}}` : '';
+  const cmd = `docker exec dockers-mysql57-1 mysql -u root -proot${{dbArg}} -N -e "${{sql.replace(/"/g, '\\\\"')}}" 2>/dev/null`;
   const raw = execSync(cmd, {{ encoding: 'utf-8' }}).trim();
   if (!raw) return [];
   return raw.split('\\n').map((line) => line.split('\\t'));
@@ -234,10 +236,22 @@ disambiguated locator if provided, or narrow with `.locator('.specific-class')`,
 
 3. **Waits**: Use `await page.waitForTimeout(2000)` after clicks that trigger \
 navigation or async loading. Use `await page.waitForURL(...)` after navigations. \
-Use `await page.waitForSelector(...)` when waiting for specific elements.
+Use `await page.waitForSelector(...)` when waiting for specific elements. \
+After login, prefer `await page.waitForTimeout(3000)` over `waitForURL` because \
+login redirects may land on the exact BASE_URL with no trailing path.
 
 4. **Login flow**: If the recorded actions include filling email/password and \
 clicking Sign In, generate a complete login step. Use `CREDENTIALS` object.
+
+4b. **Dynamic data in locators**: NEVER hardcode quantities, counts, or other \
+numbers that change between runs into `getByText()` locators. For example, if \
+the action summary shows `getByText('test 1')` where '1' is a stock quantity, \
+the test must NOT use `getByText('test 1')` because the quantity will differ on \
+the next run. Instead:
+   - If you have a pre-check DB query that fetches the current value, build the \
+locator dynamically: ``page.getByText(`test ${{preSourceTotal}}`)``
+   - Or use a partial text match: `page.locator(':text("test")').first()`
+   - Or use a structural selector (CSS class, parent container + nth-child)
 
 5. **DB Verification** (CRITICAL): Convert EVERY DB check into real executable code:
    - Call `mysqlQuery(sql)` with the exact SQL from verification results
@@ -302,6 +316,7 @@ async def generate_test_code(
         db_verifications=db_text,
         extracted_data=extracted,
         auth_info=auth_info,
+        default_database="inkstation",
     )
 
     client, model_name = _get_model_client(model)
@@ -527,12 +542,6 @@ async def generate_and_validate(
             logger.info(f"[codegen] test PASSED on attempt {attempt}")
             return file_path, True
 
-        if attempt >= MAX_FIX_ATTEMPTS:
-            logger.warning(
-                f"[codegen] test still failing after {MAX_FIX_ATTEMPTS} attempts, giving up"
-            )
-            break
-
         # Combine stdout + stderr for error context
         error_output = ""
         if stderr:
@@ -541,6 +550,12 @@ async def generate_and_validate(
             error_output += "\n" + stdout
 
         logger.info(f"[codegen] attempt {attempt} failed, asking LLM to fix...\n--- error output ---\n{error_output[:2000]}\n--- end ---")
+
+        if attempt >= MAX_FIX_ATTEMPTS:
+            logger.warning(
+                f"[codegen] test still failing after {MAX_FIX_ATTEMPTS} attempts, giving up"
+            )
+            break
         fixed_code = await _fix_test_code(code, error_output, model)
         if not fixed_code:
             logger.warning("[codegen] LLM fix failed, stopping")
@@ -552,6 +567,24 @@ async def generate_and_validate(
         logger.info(f"[codegen] saved fix to {file_path}")
 
     return file_path, False
+
+
+def _load_db_aliases() -> dict[str, str]:
+    """Load DB alias mappings from DB_ALIASES env var.
+
+    Format: "alias1:real1,alias2:real2,..."
+    Returns {alias_name: real_database_name}.
+    """
+    raw = os.environ.get("DB_ALIASES", "")
+    if not raw:
+        return {}
+    aliases = {}
+    for pair in raw.split(","):
+        pair = pair.strip()
+        if ":" in pair:
+            alias, real = pair.split(":", 1)
+            aliases[alias.strip()] = real.strip()
+    return aliases
 
 
 # ── Claude Code CLI variants ────────────────────────────────────
@@ -577,6 +610,7 @@ def _build_codegen_prompt(
     profile: ProjectProfile,
     file_path: Path,
     scenario: str = "",
+    db_checks: list | None = None,
 ) -> str:
     """Build the prompt for CLI codegen — instructs Claude to write the file directly."""
     action_summary = _build_steps_summary(report)
@@ -616,6 +650,30 @@ def _build_codegen_prompt(
 
     scenario_text = scenario or report.scenario_summary
 
+    # Extract database names from db_checks and resolve aliases
+    db_aliases = _load_db_aliases()
+    db_info_lines: list[str] = []
+    db_names: set[str] = set()
+    for check in (db_checks or []):
+        if not isinstance(check, str) and hasattr(check, 'table') and check.table and '.' in check.table:
+            alias_name, table_name = check.table.rsplit('.', 1)
+            real_name = db_aliases.get(alias_name, alias_name)
+            db_names.add(real_name)
+            db_info_lines.append(f"  - {real_name}.{table_name} (from {check.table})")
+    if db_names:
+        db_info_lines.insert(0, "## Database Info")
+        db_info_lines.insert(1, f"Database(s): {', '.join(sorted(db_names))}")
+        db_info_lines.insert(2, "Tables:")
+        db_info_lines.append("")
+        db_info_lines.append(
+            "IMPORTANT: The SQL queries in DB Verification Results use unqualified table names. "
+            "In the generated code, you MUST either:\n"
+            f"  (a) Use fully qualified table names: `{next(iter(db_names))}.table_name`\n"
+            f"  (b) Or pass the database as second arg: `mysqlQuery(sql, '{next(iter(db_names))}')`\n"
+            "The mysqlQuery() helper default database is set to the resolved name."
+        )
+    db_info = "\n".join(db_info_lines)
+
     base_prompt = _CODEGEN_PROMPT.format(
         base_url=profile.environment.base_url,
         scenario_summary=scenario_text,
@@ -623,13 +681,18 @@ def _build_codegen_prompt(
         db_verifications=db_text,
         extracted_data=extracted,
         auth_info=auth_info,
+        default_database=next(iter(db_names), "inkstation"),
     )
 
-    return (
-        f"{base_prompt}\n\n"
+    extra_sections = []
+    if db_info:
+        extra_sections.append(db_info)
+    extra_sections.append(
         f"IMPORTANT: Write the generated code to this file: {file_path.resolve()}\n"
         f"Use the Write tool to save the complete .js file."
     )
+
+    return f"{base_prompt}\n\n" + "\n\n".join(extra_sections)
 
 
 async def generate_and_validate_cli(
@@ -638,6 +701,7 @@ async def generate_and_validate_cli(
     output_dir: str | Path = "artifacts/generated_tests",
     scenario_name: str = "test",
     scenario: str = "",
+    db_checks: list | None = None,
 ) -> tuple[Path | None, bool]:
     """CLI codegen: let Claude write the file directly, then validate by running it."""
     from universal_debug_agent.orchestrator.claude_executor import _run_claude_cli
@@ -652,7 +716,7 @@ async def generate_and_validate_cli(
     file_path = out / f"{safe_name}.js"
 
     # Step 1: Generate — Claude writes the file via its tools
-    prompt = _build_codegen_prompt(report, profile, file_path, scenario)
+    prompt = _build_codegen_prompt(report, profile, file_path, scenario, db_checks=db_checks)
     try:
         _, _, rc = await _run_claude_cli(
             prompt, timeout_seconds=300, label="codegen",
@@ -668,8 +732,8 @@ async def generate_and_validate_cli(
     logger.info(f"[codegen-cli] generated {file_path.stat().st_size} bytes -> {file_path}")
 
     # Step 2: Run → fix loop
-    for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
-        logger.info(f"[codegen-cli] validation attempt {attempt}/{MAX_FIX_ATTEMPTS}")
+    for attempt in range(1, MAX_FIX_ATTEMPTS_CLI + 1):
+        logger.info(f"[codegen-cli] validation attempt {attempt}/{MAX_FIX_ATTEMPTS_CLI}")
 
         passed, stdout, stderr = await asyncio.to_thread(
             run_generated_test, file_path
@@ -687,9 +751,9 @@ async def generate_and_validate_cli(
 
         logger.info(f"[codegen-cli] attempt {attempt} failed, error:\n{error_output[:2000]}")
 
-        if attempt >= MAX_FIX_ATTEMPTS:
+        if attempt >= MAX_FIX_ATTEMPTS_CLI:
             logger.warning(
-                f"[codegen-cli] still failing after {MAX_FIX_ATTEMPTS} attempts"
+                f"[codegen-cli] still failing after {MAX_FIX_ATTEMPTS_CLI} attempts"
             )
             break
 
