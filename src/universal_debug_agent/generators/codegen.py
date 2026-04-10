@@ -726,7 +726,7 @@ async def generate_and_validate_cli(
     prompt = _build_codegen_prompt(report, profile, file_path, scenario, db_checks=db_checks)
     try:
         _, _, rc = await _run_claude_cli(
-            prompt, timeout_seconds=300, label="codegen",
+            prompt, timeout_seconds=600, label="codegen",
         )
     except Exception as e:
         logger.error(f"[codegen-cli] generation failed: {type(e).__name__}: {e!r}")
