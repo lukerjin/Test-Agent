@@ -237,11 +237,18 @@ disambiguated locator if provided, or narrow with `.locator('.specific-class')`,
 3. **Waits**: Use `await page.waitForTimeout(2000)` after clicks that trigger \
 navigation or async loading. Use `await page.waitForURL(...)` after navigations. \
 Use `await page.waitForSelector(...)` when waiting for specific elements. \
-After login, prefer `await page.waitForTimeout(3000)` over `waitForURL` because \
-login redirects may land on the exact BASE_URL with no trailing path.
+After login, ALWAYS use `await page.waitForTimeout(3000)` instead of `waitForURL` \
+because: (a) login may redirect through a different domain (e.g. SSO/backend auth) \
+before landing back on the app, and (b) the final URL may be exactly BASE_URL with \
+no trailing path, which won't match `BASE_URL/**` glob patterns.
 
 4. **Login flow**: If the recorded actions include filling email/password and \
-clicking Sign In, generate a complete login step. Use `CREDENTIALS` object.
+clicking Sign In, generate a complete login step. Use `CREDENTIALS` object. \
+NOTE: The login page URL in the action summary may show a redirect to a \
+different domain (e.g. `backend.local.test/...login.php`). The generated test \
+should navigate to the login URL from the Auth Info section and handle the \
+redirect — fill credentials on whatever page appears after navigation, then \
+wait with `waitForTimeout` (NOT `waitForURL`) after clicking submit.
 
 4b. **Dynamic data in locators**: NEVER hardcode quantities, counts, or other \
 numbers that change between runs into `getByText()` locators. For example, if \
