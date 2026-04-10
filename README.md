@@ -1,6 +1,6 @@
 # Universal Test Agent
 
-An AI-powered E2E test execution and data verification agent built on the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
+An AI-powered E2E test execution and data verification agent. Supports two execution engines: [OpenAI Agents SDK](https://github.com/openai/openai-agents-python) (default) and [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code).
 
 Give it a business scenario in natural language. It walks through the entire flow, handles obstacles on its own, and verifies that the right data landed in the database. **Any scenario, not limited to a fixed flow.**
 
@@ -18,7 +18,22 @@ Give it a business scenario in natural language. It walks through the entire flo
 
 ## Architecture
 
+### Dual Execution Mode
+
+The agent supports two execution engines, selected via `execution_mode` in the profile or `--mode` CLI flag:
+
+| | Agent Mode (default) | CLI Mode |
+|---|---|---|
+| **Engine** | OpenAI Agents SDK ReAct loop | `claude -p` (Claude Code CLI) |
+| **UI execution** | Brain Agent + Playwright MCP (in-process) | `claude -p` + Playwright MCP (subprocess, `--mcp-config`) |
+| **DB verification** | DB Sub-Agent via `Runner.run()` | `claude -p` + DB MCP (subprocess) |
+| **Lesson generation** | LessonWriter via `Runner.run()` | `claude -p` (no MCP) |
+| **LLM provider** | OpenAI / Gemini / DeepSeek / Groq | Anthropic (Claude) |
+| **Context management** | `MCPToolOutputFilter` + StuckDetector | Claude Code handles internally |
+| **MCP lifecycle** | Parent process connects/disconnects | Each `claude -p` subprocess manages its own |
+
 ```
+execution_mode: agent (default)
 +------------------------------------------------------------+
 |         UI Agent (ReAct / Analysis) -- no DB access        |
 |        Orchestrator + StuckDetector control mode switching  |
@@ -36,6 +51,26 @@ Give it a business scenario in natural language. It walks through the entire flo
 |          |          |          |  +----------------------+ |
 +----------+----------+----------+---------------------------+
 |       LLM Provider (OpenAI / Gemini / DeepSeek / ...)      |
++------------------------------------------------------------+
+
+execution_mode: cli
++------------------------------------------------------------+
+|              Orchestrator (_run_pipeline_cli)               |
+|   3 independent claude -p calls, each a subprocess         |
++------------------------------------------------------------+
+|  Step 1: UI Execution        |  claude -p + Playwright MCP |
+|  (run_scenario_cli)          |  --mcp-config <playwright>  |
+|                              |  → CLIResult JSON           |
++------------------------------+-----------------------------+
+|  Step 2: DB Verification     |  claude -p + DB MCP         |
+|  (verify_db_cli)             |  --mcp-config <database>    |
+|                              |  → DataVerification[]       |
++------------------------------+-----------------------------+
+|  Step 3: Lesson Generation   |  claude -p (no MCP)         |
+|  (generate_lesson_cli)       |  → {lesson, tags}           |
++------------------------------+-----------------------------+
+|                 stderr streamed in real-time                |
+|            stdout collected → JSON parsed                   |
 +------------------------------------------------------------+
 |                  Project Profile (YAML)                     |
 |     per-project config: env, auth, LLM, boundaries, tools  |
@@ -56,11 +91,14 @@ pip install -e .
 ### 2. Set API Key
 
 ```bash
-# OpenAI
+# Agent mode (OpenAI)
 export OPENAI_API_KEY=your_key
 
 # Or Gemini (free tier available)
 export GEMINI_API_KEY=your_key
+
+# CLI mode (Claude) — requires Claude Code CLI installed
+# npm install -g @anthropic-ai/claude-code
 ```
 
 ### 3. Create a Project Profile
@@ -99,6 +137,9 @@ test-agent test \
 
 # Use a named scenario from the profile
 test-agent test -p profiles/my_project.yaml -s checkout
+
+# Run with Claude Code CLI instead of OpenAI Agents SDK
+test-agent test -p profiles/my_project.yaml -s checkout --mode cli
 
 # List all available scenarios
 test-agent test -p profiles/my_project.yaml
@@ -374,6 +415,7 @@ Options:
   -p, --profile TEXT     Project Profile YAML path (required)
   -s, --scenario TEXT    Test scenario description or named scenario from profile
   -o, --output TEXT      Report output file path (defaults to terminal)
+  -m, --mode TEXT        Execution mode: "agent" (default) or "cli" (Claude Code CLI)
   --max-steps INT        Override max_steps from profile
   -v, --verbose          Enable verbose logging
 
@@ -417,6 +459,51 @@ model:
 ```
 
 API keys are auto-detected by provider (`GEMINI_API_KEY`, `OPENAI_API_KEY`, etc.), or explicitly set via `api_key_env`.
+
+---
+
+## Claude Code CLI Mode
+
+When `execution_mode: cli` (or `--mode cli`), the entire pipeline runs through Claude Code CLI (`claude -p`) instead of the OpenAI Agents SDK. No OpenAI API key is needed — only a working Claude Code CLI installation.
+
+### How It Works
+
+The orchestrator makes 3 sequential `claude -p` subprocess calls:
+
+1. **UI Execution** (`run_scenario_cli`) — Claude receives the scenario prompt + Playwright MCP config, executes the browser flow, and returns a structured JSON with extracted business data and step results.
+
+2. **DB Verification** (`verify_db_cli`) — Claude receives the extracted data + db_checks + live schema + network log, connects to the DB MCP server, runs SELECT queries, and returns a DataVerification JSON array.
+
+3. **Lesson Generation** (`generate_lesson_cli`) — Claude receives the run report summary (no MCP needed) and returns a lesson + tags JSON for the memory system.
+
+### Key Differences from Agent Mode
+
+- **MCP lifecycle**: Each `claude -p` subprocess starts its own MCP servers via `--mcp-config` and tears them down on exit. The parent process does not connect/disconnect MCP servers.
+- **Streaming output**: stderr is streamed line-by-line in real-time via `logger.info`, so you can follow tool calls, MCP connections, and thinking progress live in the terminal.
+- **Permissions**: Uses `--dangerously-skip-permissions` since `-p` mode is non-interactive and cannot prompt for tool approval.
+- **Timeout**: Default 600 seconds (10 minutes) for UI execution, 300 seconds for DB verification, 60 seconds for lesson generation.
+- **No StuckDetector**: Claude Code manages its own context and retry logic internally.
+
+### Prerequisites
+
+```bash
+# Install Claude Code CLI
+npm install -g @anthropic-ai/claude-code
+
+# Verify installation
+claude --version
+```
+
+### Usage
+
+```bash
+# Via CLI flag (overrides profile)
+test-agent test -p profiles/my_project.yaml -s checkout --mode cli
+
+# Via profile (set once)
+# boundaries:
+#   execution_mode: "cli"
+```
 
 ---
 
@@ -505,6 +592,7 @@ mcp_servers:
 
 # --- Boundaries ---
 boundaries:
+  execution_mode: "agent"                       # "agent" (OpenAI Agents SDK) or "cli" (Claude Code CLI)
   readonly: true
   forbidden_actions:                            # SQL blocklist
     - "DELETE FROM"
@@ -559,6 +647,9 @@ src/universal_debug_agent/
 |   +-- prompts.py           # System prompts (ReAct + Analysis dual-mode)
 +-- orchestrator/
 |   +-- state_machine.py     # InvestigationOrchestrator + StuckDetector
+|   +-- claude_executor.py   # Claude Code CLI pipeline: run_scenario_cli,
+|   |                        #   verify_db_cli, generate_lesson_cli
+|   |                        #   shared _run_claude_cli helper (stderr streaming)
 |   +-- hooks.py             # InvestigationHooks: tool monitoring, auto-snapshot,
 |   |                        #   form capture (browser_evaluate before click),
 |   |                        #   stuck detection, trace recording
@@ -593,8 +684,9 @@ src/universal_debug_agent/
 | Execute any business flow (Playwright) | Auto-modify code |
 | Data verification (DB read-only queries) | Write to database |
 | Scenario-level db_checks (plain + structured) | Auto-create PRs |
-| Auto-snapshot + same-page boundary | Solve CAPTCHA / 2FA |
-| Form capture for traditional POST submissions | Unlimited external domain browsing |
+| Dual execution engine: OpenAI Agents SDK or Claude Code CLI | Solve CAPTCHA / 2FA |
+| Auto-snapshot + same-page boundary | Unlimited external domain browsing |
+| Form capture for traditional POST submissions | |
 | Network log + form data auto-injection to DB agent | |
 | Auto-handle login / popup / loading | |
 | Read local code to assist understanding | |

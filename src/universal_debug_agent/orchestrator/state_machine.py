@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
-import re
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -17,13 +15,20 @@ from agents.mcp import MCPServerStdio
 from pathlib import Path
 
 from universal_debug_agent.agents.brain import create_brain_agent
+from universal_debug_agent.generators.codegen import generate_and_validate, generate_and_validate_cli
 from universal_debug_agent.tools import db_tool
 from universal_debug_agent.memory.lesson import generate_lesson
 from universal_debug_agent.orchestrator.hooks import InvestigationHooks, SwitchToAnalysisMode
 from universal_debug_agent.orchestrator.input_filters import MCPToolOutputFilter
+from universal_debug_agent.orchestrator.claude_executor import (
+    run_scenario_cli,
+    cli_result_to_report,
+    verify_db_cli,
+    generate_lesson_cli,
+)
 from universal_debug_agent.observability.llm_usage import LLMUsageTracker
 from universal_debug_agent.observability.trace_recorder import ExecutionTraceRecorder
-from universal_debug_agent.schemas.profile import ProjectProfile
+from universal_debug_agent.schemas.profile import DBCheckItem, ProjectProfile
 from universal_debug_agent.schemas.report import (
     ReportMetadata,
     StepStatus,
@@ -169,7 +174,7 @@ class InvestigationOrchestrator:
         memory_context: str = "",
         usage_tracker: LLMUsageTracker | None = None,
         trace_recorder: ExecutionTraceRecorder | None = None,
-        db_checks: list[str | Any] | None = None,
+        db_checks: list[DBCheckItem] | None = None,
         scenario_name: str | None = None,
     ):
         self.profile = profile
@@ -182,6 +187,10 @@ class InvestigationOrchestrator:
         self.last_error_output_path: str = ""
         self.last_lesson: str = ""
         self.last_lesson_tags: list[str] = []
+        self.generated_test_path: str = ""
+        self._hooks: InvestigationHooks | None = None
+        self._scenario_name = scenario_name
+        self._cli_result = None  # Saved for CLI-mode codegen
         self.state = InvestigationState.REACT
         self.stuck_detector = StuckDetector(
             max_steps=profile.boundaries.max_steps,
@@ -225,6 +234,7 @@ class InvestigationOrchestrator:
             db_checks=db_checks,
             scenario_name=scenario_name,
         )
+        self.db_checks = db_checks
         db_tool.clear_captured_form_data()
 
     @staticmethod
@@ -241,19 +251,37 @@ class InvestigationOrchestrator:
     async def run(self, scenario: str) -> ScenarioReport:
         """Run the full test execution pipeline."""
 
-        # Connect all MCP servers before running
-        for server in self.mcp_servers:
-            try:
-                await server.connect()
-                logger.info(f"Connected MCP server: {server.name}")
-            except Exception as e:
-                logger.error(f"Failed to connect MCP server {server.name}: {e}")
-                raise
+        is_cli = self.profile.boundaries.execution_mode == "cli"
+
+        # CLI mode: claude -p subprocess manages its own MCP connections.
+        # Agent mode: we need to connect MCP servers in this process.
+        if not is_cli:
+            for server in self.mcp_servers:
+                try:
+                    await server.connect()
+                    logger.info(f"Connected MCP server: {server.name}")
+                except Exception as e:
+                    logger.error(f"Failed to connect MCP server {server.name}: {e}")
+                    raise
 
         try:
-            report = await self._run_pipeline(scenario)
+            if is_cli:
+                report = await self._run_pipeline_cli(scenario)
+            else:
+                report = await self._run_pipeline(scenario)
             # Generate lesson BEFORE cleanup so anyio scopes from MCP servers are still clean
-            self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
+            if is_cli:
+                self.last_lesson, self.last_lesson_tags = await generate_lesson_cli(report, scenario)
+            else:
+                self.last_lesson, self.last_lesson_tags = await generate_lesson(report, scenario, model=self.model)
+
+            # v2: generate executable test code when all checks pass
+            should_gen = self._should_generate_test(report)
+            logger.info(f"[codegen] should_generate_test={should_gen}, status={report.overall_status.value}, "
+                        f"cli_result_steps={len(self._cli_result.steps) if self._cli_result else 'N/A'}, "
+                        f"hooks={self._hooks is not None}")
+            if should_gen:
+                await self._generate_test(report, scenario)
             return report
         except BaseException as e:
             if self.usage_tracker is not None:
@@ -263,12 +291,12 @@ class InvestigationOrchestrator:
                 self.last_error_output_path = str(error_path) if error_path else ""
             raise
         finally:
-            # Disconnect all MCP servers (suppress all errors to preserve original exception)
-            for server in self.mcp_servers:
-                try:
-                    await server.cleanup()
-                except BaseException as e:
-                    logger.warning(f"Error cleaning up MCP server {server.name}: {e}")
+            if not is_cli:
+                for server in self.mcp_servers:
+                    try:
+                        await server.cleanup()
+                    except BaseException as e:
+                        logger.warning(f"Error cleaning up MCP server {server.name}: {e}")
 
     async def _run_pipeline(self, scenario: str) -> ScenarioReport:
         """Internal pipeline after MCP servers are connected."""
@@ -286,6 +314,7 @@ class InvestigationOrchestrator:
             trace_recorder=self.trace_recorder,
             playwright_server=playwright_server,
         )
+        self._hooks = hooks
         # Connect hooks to filter so auto-snapshots can be injected
         self._run_config.call_model_input_filter.hooks = hooks
 
@@ -331,6 +360,58 @@ class InvestigationOrchestrator:
                 return await self._run_analysis(scenario, mode_switch.evidence_summary)
             raise
 
+    async def _run_pipeline_cli(self, scenario: str) -> ScenarioReport:
+        """Run UI execution via Claude Code CLI, then DB verification separately."""
+        self.state = InvestigationState.REACT
+        logger.info("Phase: UI execution (Claude Code CLI)")
+
+        # Step 1: Run UI scenario via Claude Code CLI
+        cli_result = await run_scenario_cli(
+            scenario=scenario,
+            profile=self.profile,
+            db_checks=self.db_checks,
+            timeout_seconds=600,
+        )
+
+        self._cli_result = cli_result  # Save for codegen
+
+        if self.trace_recorder is not None:
+            self.trace_recorder.record(
+                "cli_result",
+                "Claude CLI Result",
+                f"success={cli_result.success}, "
+                f"steps={len(cli_result.steps)}, "
+                f"extracted_data={json.dumps(cli_result.extracted_data)}, "
+                f"error={cli_result.error}\n\n"
+                f"## Raw Output ({len(cli_result.raw_output)} chars)\n"
+                f"{cli_result.raw_output[:3000]}",
+            )
+
+        # Step 2: Run DB verification via CLI if we have db_checks and extracted data
+        db_verifications: list[dict] | None = None
+        logger.info(
+            f"[cli] DB verify gate: db_checks={bool(self.db_checks)} ({len(self.db_checks) if self.db_checks else 0}), "
+            f"success={cli_result.success}, extracted_data={bool(cli_result.extracted_data)}"
+        )
+        if self.db_checks and cli_result.success:
+            logger.info("Phase: DB verification (Claude Code CLI)")
+            db_verifications = await verify_db_cli(
+                data_json=json.dumps(cli_result.extracted_data),
+                profile=self.profile,
+                db_checks=self.db_checks,
+            )
+
+        # Step 3: Build report
+        report = cli_result_to_report(cli_result, scenario, db_verifications)
+        report.metadata = ReportMetadata(
+            profile_name=self.profile.project.name,
+            total_steps=len(cli_result.steps),
+            mode_switches=0,
+        )
+
+        self.state = InvestigationState.DONE
+        return report
+
     async def _run_analysis(self, scenario: str, evidence_summary: str) -> ScenarioReport:
         """Phase 2: Analysis mode — analyze what happened when agent got stuck."""
         self.state = InvestigationState.ANALYZING
@@ -370,6 +451,59 @@ class InvestigationOrchestrator:
             raw_path = self.usage_tracker.write_final_output(result.final_output)
             self.last_raw_output_path = str(raw_path) if raw_path else ""
         return self._extract_report(result)
+
+    def _should_generate_test(self, report: ScenarioReport) -> bool:
+        """Check if the run qualifies for test code generation."""
+        if report.overall_status != StepStatus.PASS:
+            return False
+        # CLI mode: need cli_result with steps; Agent mode: need hooks with action log
+        is_cli = self.profile.boundaries.execution_mode == "cli"
+        if is_cli:
+            if not self._cli_result or not self._cli_result.steps:
+                return False
+        else:
+            if not self._hooks or not self._hooks.action_log.records:
+                return False
+        # All data verifications must pass (if any exist)
+        for v in report.data_verifications:
+            if v.status != StepStatus.PASS:
+                return False
+        return True
+
+    async def _generate_test(self, report: ScenarioReport, scenario: str) -> None:
+        """Generate executable test code, validate by running it, fix on failure."""
+        logger.info("Phase: Test code generation + validation")
+
+        output_dir = Path("artifacts") / "generated_tests"
+        scenario_name = getattr(self, "_scenario_name", None) or "test"
+
+        if self.profile.boundaries.execution_mode == "cli":
+            path, passed = await generate_and_validate_cli(
+                report=report,
+                profile=self.profile,
+                output_dir=output_dir,
+                scenario_name=scenario_name,
+                scenario=scenario,
+                db_checks=self.db_checks,
+            )
+        elif self._hooks is None:
+            return
+        else:
+            path, passed = await generate_and_validate(
+                action_log=self._hooks.action_log,
+                ref_map=self._hooks.ref_map,
+                report=report,
+                profile=self.profile,
+                model=self.model,
+                output_dir=output_dir,
+                scenario_name=scenario_name,
+            )
+        if path:
+            self.generated_test_path = str(path)
+            if passed:
+                logger.info(f"[codegen] validated test saved to {path}")
+            else:
+                logger.warning(f"[codegen] test saved but NOT passing: {path}")
 
     def _unwrap_mode_switch(self, error: BaseException) -> SwitchToAnalysisMode | None:
         current: BaseException | None = error
